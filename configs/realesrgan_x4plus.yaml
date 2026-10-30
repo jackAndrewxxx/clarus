@@ -1,0 +1,24 @@
+# Real-ESRGAN x4plus (Wang et al., ICCVW 2021): RRDBNet generator, x4 super-resolution.
+# Weights: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+
+model:
+  name: rrdbnet
+  checkpoint: ../checkpoints/RealESRGAN_x4plus.pth
+  network_g: {type: RRDBNet, num_in_ch: 3, num_out_ch: 3, scale: 4, num_feat: 64, num_block: 23, num_grow_ch: 32}
+
+runtime:
+  device: cuda:0
+  dtype: fp16
+  backends: [triton, torch]
+  # SR test sets have many image sizes (Urban100: 37); one graph per size costs a capture
+  # each at start-up, and these convolutions are long enough that eager launch is ~free.
+  graphs: false
+
+scheduler:
+  batch_sizes: [1]
+  batching: static
+  shapes: auto
+  inflight: 3
+
+io:
+  threads: 16

@@ -1,0 +1,29 @@
+# FFTformer (Kong et al., CVPR 2023), official GoPro weights (pretrain_model/fftformer_GoPro.pth
+# in https://github.com/kkkls/FFTformer).
+
+model:
+  name: fftformer
+  checkpoint: ../checkpoints/fftformer_GoPro.pth
+  network_g:        # basicsr/models/archs/fftformer_arch.py defaults
+    type: fftformer
+    inp_channels: 3
+    out_channels: 3
+    dim: 48
+    num_blocks: [6, 6, 12, 8]
+    num_refinement_blocks: 4
+    ffn_expansion_factor: 3
+    bias: false
+
+runtime:
+  device: cuda:0
+  dtype: fp16
+  backends: [triton, torch]
+
+scheduler:
+  batch_sizes: [1]
+  batching: static
+  shapes: auto
+  inflight: 3
+
+io:
+  threads: 16

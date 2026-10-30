@@ -1,0 +1,7 @@
+engine/target/
+__pycache__/
+*.pyc
+cache/
+checkpoints/*
+!checkpoints/README.md
+bench_logs/

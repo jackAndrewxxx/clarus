@@ -1,0 +1,6 @@
+# Interpreter whose environment (torch, triton) the embedded model worker uses.
+# PyO3 links against its libpython. Point it at your venv, e.g.
+#   PYO3_PYTHON=/path/to/venv/bin/python cargo build --release
+# (an exported value takes precedence over this default).
+[env]
+PYO3_PYTHON = "python3"

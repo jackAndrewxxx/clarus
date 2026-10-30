@@ -1,0 +1,43 @@
+# clarus config: official NAFNet (Chen et al., ECCV 2022) GoPro deblurring, width 64
+# (megvii-research/NAFNet, same network as options/test/GoPro/NAFNet-width64.yml). The default config.
+#
+# model:/runtime: are handed to the Python worker; scheduler:/io: are used by the Rust engine.
+# Relative paths are resolved against this file's directory. Every key can be overridden on the
+# command line with --set section.key=value (see `clarus --help` for shortcuts).
+
+model:
+  name: nafnet                      # registered model (python/clarus/models); external ones via plugins
+  plugins: []                       # python modules imported first, e.g. [my_models.mynet]
+  checkpoint: ../checkpoints/NAFNet-GoPro-width64.pth   # put / symlink your weights here
+  # The network, as the basicsr `network_g` the checkpoint was trained with. Instead of inlining
+  # it you can point at the training / test yml: `arch_from: path/to/x.yml` (keys here then override it).
+  network_g:
+    type: NAFNetLocal
+    width: 64
+    enc_blk_nums: [1, 1, 1, 28]
+    middle_blk_num: 1
+    dec_blk_nums: [1, 1, 1, 1]
+  options:
+    residual_fp32_from_level: 3     # fp32 residual stream from this pyramid level (0 = all, --safe)
+
+runtime:
+  device: cuda:0                    # cuda:N | cpu | <torch accelerator>:N (e.g. npu:0)
+  device_imports: []                # modules that register the device with torch, e.g. [torch_npu]
+  dtype: fp16                       # activation dtype: fp16 | bf16 | fp32 (fp32 => torch backend only)
+  backends: [triton, torch]         # op dispatch order; an op falls through to the next backend
+  op_overrides: {}                  # pin single ops, e.g. {selective_scan: torch}
+  graphs: auto                      # capture device graphs: auto | true | false
+  max_graphs: 128                   # graph LRU size (one per batch size x image shape)
+  metrics_backend: auto             # PSNR/SSIM implementation: auto | triton | torch
+
+scheduler:
+  batch_sizes: [1, 2]               # graph batch sizes; short batches are padded to the next size
+  batching: static                  # static: batches fixed from the file list (bit-reproducible)
+                                    # dynamic: batches formed as decodes finish
+  shapes: auto                      # auto: shapes found in the input set; or a fixed list [[h, w], ...]
+  unknown_shape: reject             # with a fixed list: reject | lazy (prepare on first use)
+  inflight: 3                       # batches queued on the device
+
+io:
+  threads: 16                       # PNG decode / encode threads
+  png_level: 1                      # 0 none, 1 fast, 2-6 balanced, 7+ high

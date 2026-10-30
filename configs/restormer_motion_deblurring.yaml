@@ -1,0 +1,34 @@
+# Restormer (Zamir et al., CVPR 2022), official motion-deblurring weights (GoPro).
+# Weights: https://github.com/swz30/Restormer/releases/download/v1.0/motion_deblurring.pth
+
+model:
+  name: restormer
+  checkpoint: ../checkpoints/restormer_motion_deblurring.pth
+  network_g:        # Motion_Deblurring/Options/Deblurring_Restormer.yml
+    type: Restormer
+    inp_channels: 3
+    out_channels: 3
+    dim: 48
+    num_blocks: [4, 6, 6, 8]
+    num_refinement_blocks: 4
+    heads: [1, 2, 4, 8]
+    ffn_expansion_factor: 2.66
+    bias: false
+    LayerNorm_type: WithBias
+    dual_pixel_task: false
+  options:
+    residual_fp32_from_level: 99   # fp16 residual stream: measured peak |x| on GoPro is ~35
+
+runtime:
+  device: cuda:0
+  dtype: fp16
+  backends: [triton, torch]
+
+scheduler:
+  batch_sizes: [1]
+  batching: static
+  shapes: auto
+  inflight: 3
+
+io:
+  threads: 16

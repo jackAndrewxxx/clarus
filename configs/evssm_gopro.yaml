@@ -1,0 +1,28 @@
+# EVSSM (Kong et al., CVPR 2025), official GoPro weights (net_g_GoPro.pth, linked from
+# https://github.com/kkkls/EVSSM).
+
+model:
+  name: evssm
+  checkpoint: ../checkpoints/EVSSM_GoPro.pth
+  network_g:        # models/EVSSM.py defaults
+    type: EVSSM
+    inp_channels: 3
+    out_channels: 3
+    dim: 48
+    num_blocks: [6, 6, 12]
+    ffn_expansion_factor: 3
+    bias: false
+
+runtime:
+  device: cuda:0
+  dtype: fp16
+  backends: [triton, torch]
+
+scheduler:
+  batch_sizes: [1]
+  batching: static
+  shapes: auto
+  inflight: 3
+
+io:
+  threads: 16
