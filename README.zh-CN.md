@@ -6,7 +6,7 @@
 
 已内置并可直接加载官方权重的模型：NAFNet（NAFNet / NAFNetLocal 系列只要给出 basicsr 的 `network_g` 就能跑，不用改代码）、Restormer、Real-ESRGAN（RRDBNet）、FFTformer 和 EVSSM。新网络以 Python 类的形式接入；新硬件先用 PyTorch 后端跑通，再逐个算子补快速 kernel。
 
-- 单张 A30 上，**端到端比各模型官方测试脚本快 6.5–7.8 倍**，PSNR / SSIM 一致
+- 单张 A30 上，**端到端比各模型官方测试脚本快 7.2–8.4 倍**，PSNR / SSIM 一致
 - **Rust 核心**：YAML 配置、PNG IO 线程池（`png` + `rayon`）、按 shape 分桶的调度器、PyO3 宿主
 - **按算子分派后端**：Triton 不支持的调用自动交给 PyTorch，可以逐个算子混用，每次运行都会列出回退的算子
 - **定长模式**：固定 shape 和 batch 大小，启动时捕获全部设备 graph，组批逐位可复现
@@ -31,13 +31,13 @@
 
 | 模型（任务） | 数据 | 官方脚本 | 官方 | clarus | 加速 | 质量，官方 → clarus |
 |---|---|---|---|---|---|---|
-| NAFNet-GoPro-width64（去模糊） | GoPro test，1111 张 720p | `basicsr/test.py`（fp32） | 517.9 s | 67.4 s（`eval`） | **7.7×** | PSNR / SSIM 33.7103 / 0.9668 → 33.7103 / 0.9668 |
-| Restormer（运动去模糊） | GoPro test，1111 张 720p | `Motion_Deblurring/test.py`（fp32，保存 PNG） | 1802.1 s | 276.1 s（`infer --save`） | **6.5×** | PSNR 32.9177 → 32.9177；0.9% 的像素不同，差值 ≤ 2 |
-| FFTformer（去模糊） | GoPro test，1111 张 720p | `test.py`（fp32，保存 PNG） | 2743.9 s | 403.9 s（`eval --save`） | **6.8×** | PSNR / SSIM 34.2115 / 0.9694 → 34.2113 / 0.9694；1.2% 的像素不同，差值 ≤ 5 |
-| EVSSM（去模糊，Mamba） | GoPro test，1111 张 720p | `test.py`（fp32，mamba_ssm CUDA 扫描，保存 PNG） | 3972 s | 506.3 s（`eval --save`） | **7.8×** | PSNR / SSIM 34.5106 / 0.9713 → 34.5103 / 0.9713；2.4% 的像素不同，差值 ≤ 4 |
-| Real-ESRGAN x4plus（×4 超分） | Urban100 LR×4，100 张，37 种尺寸 | `inference_realesrgan.py`（默认 fp16） | 20.7 s | 13.0 s（`infer --save`） | **1.6×** | 对 HR 的 PSNR 21.0561 → 21.0568；比官方 fp16 更接近 fp32 参考（5.2% vs 7.2% 的像素不同） |
+| NAFNet-GoPro-width64（去模糊） | GoPro test，1111 张 720p | `basicsr/test.py`（fp32） | 517.9 s | 65.5 s（`eval`） | **7.9×** | PSNR / SSIM 33.7103 / 0.9668 → 33.7103 / 0.9668 |
+| Restormer（运动去模糊） | GoPro test，1111 张 720p | `Motion_Deblurring/test.py`（fp32，保存 PNG） | 1802.1 s | 227.1 s（`infer --save`） | **7.9×** | PSNR 32.9177 → 32.9177；0.9% 的像素不同，差值 ≤ 2 |
+| FFTformer（去模糊） | GoPro test，1111 张 720p | `test.py`（fp32，保存 PNG） | 2743.9 s | 381.4 s（`eval --save`） | **7.2×** | PSNR / SSIM 34.2115 / 0.9694 → 34.2113 / 0.9694；1.2% 的像素不同，差值 ≤ 5 |
+| EVSSM（去模糊，Mamba） | GoPro test，1111 张 720p | `test.py`（fp32，mamba_ssm CUDA 扫描，保存 PNG） | 3972 s | 473.0 s（`eval --save`） | **8.4×** | PSNR / SSIM 34.5106 / 0.9713 → 34.5103 / 0.9713；2.4% 的像素不同，差值 ≤ 4 |
+| Real-ESRGAN x4plus（×4 超分） | Urban100 LR×4，100 张，37 种尺寸 | `inference_realesrgan.py`（默认 fp16） | 20.7 s | 12.0 s（`infer --save`） | **1.7×** | 对 HR 的 PSNR 21.0561 → 21.0568；比官方 fp16 更接近 fp32 参考（5.2% vs 7.2% 的像素不同） |
 
-单次前向（batch 1）：NAFNet 720p 251.0 → 54.8 ms；Restormer 720p 1482 → 238 ms；RRDBNet 输入 256×384 时 250（官方 fp32）/ 167（官方 fp16）→ 116 ms；FFTformer 720p 2030 → 349 ms；EVSSM 720p 3149 → 433 ms。FFTformer / EVSSM 的 PSNR / SSIM 都是用 `tools/score_outputs.py` 在保存的 PNG 上算的（`clarus eval` 自己报 34.2113 / 0.9692 和 34.5103 / 0.9711，SSIM 的差来自 basicsr 在 GPU 上用 TF32 算 SSIM）。Real-ESRGAN 加速最少：它的 3×3 卷积本来就是 cuDNN fp16 的强项，clarus 的收益主要来自 NHWC 布局，以及把密集块的拼接、LeakyReLU 和上采样融合进卷积。
+单次前向（batch 1）：NAFNet 720p 251.0 → 53.3 ms；Restormer 720p 1482 → 199 ms；RRDBNet 输入 256×384 时 250（官方 fp32）/ 167（官方 fp16）→ 84 ms；FFTformer 720p 2030 → 330 ms；EVSSM 720p 3149 → 407 ms。FFTformer / EVSSM 的 PSNR / SSIM 都是用 `tools/score_outputs.py` 在保存的 PNG 上算的（`clarus eval` 自己报 34.2113 / 0.9692 和 34.5103 / 0.9711，SSIM 的差来自 basicsr 在 GPU 上用 TF32 算 SSIM）。Real-ESRGAN 加速最少：它的 3×3 卷积本来就是 cuDNN fp16 的强项，clarus 的收益主要来自 NHWC 布局，以及把密集块的拼接、LeakyReLU 和上采样融合进卷积。
 
 每一行都可以用 `clarus eval --config <配置> --report r.json` 复现（见[验证](#验证)）；运行日志不进 git。
 

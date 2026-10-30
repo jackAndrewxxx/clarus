@@ -78,7 +78,7 @@ class Tuner:
             best, best_t = None, float("inf")
             for c in candidates:
                 try:
-                    t = do_bench(lambda: launch(c), warmup=2, rep=8)
+                    t = do_bench(lambda: launch(c), warmup=5, rep=25)
                 except (triton.runtime.errors.OutOfResources, RuntimeError):
                     continue
                 if t < best_t:

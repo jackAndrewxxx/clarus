@@ -12,7 +12,14 @@ from .tuning import TUNER
 # ----------------------------------------------------------------- depthwise
 @triton.jit
 def _gelu(x):
-    return 0.5 * x * (1.0 + tl.erf(x * 0.7071067811865476))
+    """Exact (erf) GELU with erf from Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7, far below the
+    fp16 / bf16 output precision): a handful of FMAs and one exp instead of libdevice erf."""
+    z = tl.abs(x) * 0.7071067811865476
+    t = 1.0 / (1.0 + 0.3275911 * z)
+    poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+    e = 1.0 - poly * tl.exp(-z * z)
+    erf = tl.where(x >= 0, e, -e)
+    return 0.5 * x * (1.0 + erf)
 
 
 def _gate_code(gate) -> int:
@@ -75,13 +82,13 @@ def dwconv_kernel(X, Wt, BIAS, OUT, H, W, C, COUT,
 
 
 @triton.jit
-def _row3(X, base, xs, cs, W, C, m2, w0, w1, w2):
-    """3-tap horizontal weighted sum of one input row for three weight rows."""
-    vm = tl.load(base + (xs - 1).to(tl.int64)[:, None] * C + cs[None, :],
-                 mask=m2 & (xs >= 1)[:, None], other=0.0).to(tl.float32)
-    v0 = tl.load(base + xs.to(tl.int64)[:, None] * C + cs[None, :], mask=m2, other=0.0).to(tl.float32)
-    vp = tl.load(base + (xs + 1).to(tl.int64)[:, None] * C + cs[None, :],
-                 mask=m2 & (xs + 1 < W)[:, None], other=0.0).to(tl.float32)
+def _row3(base, off, C, mm, m0, mp, rv):
+    """The three horizontally shifted [BLOCK_W, BLOCK_C] tiles of one input row. `off` and the
+    masks are precomputed per program, so a row costs one pointer add per element and load."""
+    p = base + off
+    vm = tl.load(p - C, mask=mm & rv, other=0.0).to(tl.float32)
+    v0 = tl.load(p, mask=m0 & rv, other=0.0).to(tl.float32)
+    vp = tl.load(p + C, mask=mp & rv, other=0.0).to(tl.float32)
     return vm, v0, vp
 
 
@@ -132,29 +139,41 @@ def dw3x3_rows_kernel(X, Wt, BIAS, OUT, H, W, C, COUT, ROWS,
     gacc_a = tl.zeros((BLOCK_W, BLOCK_C), dtype=tl.float32)
     gacc_b = tl.zeros((BLOCK_W, BLOCK_C), dtype=tl.float32)
     m2base = xmask[:, None] & cmask[None, :]
+    off = (xs * C)[:, None] + cs[None, :]
+    ooff = (xs * COUT)[:, None] + cs[None, :]
+    mm = m2base & (xs >= 1)[:, None]
+    mp = m2base & (xs + 1 < W)[:, None]
+    # software pipelining: row r + 1 is loaded before row r's result is stored, so the loads
+    # are not serialized behind the store (the compiler cannot prove OUT does not alias X)
+    rv = (y0 - 1 >= 0) & (y0 - 1 < H)
+    rb_ptr = base_n + (y0 - 1).to(tl.int64) * W * C
+    vm, v0, vp = _row3(rb_ptr, off, C, mm, m2base, mp, rv)
+    if GATE:
+        um, u0, up = _row3(rb_ptr + COUT, off, C, mm, m2base, mp, rv)
     for r in range(y0 - 1, y1 + 1):
-        rv = (r >= 0) & (r < H)
-        m2 = m2base & rv
-        rb_ptr = base_n + r.to(tl.int64) * W * C
-        vm, v0, vp = _row3(X, rb_ptr, xs, cs, W, C, m2, 0, 0, 0)
+        nr = r + 1
+        nrv = (nr < H) & (nr <= y1)
+        n_ptr = base_n + nr.to(tl.int64) * W * C
+        nvm, nv0, nvp = _row3(n_ptr, off, C, mm, m2base, mp, nrv)
+        if GATE:
+            num, nu0, nup = _row3(n_ptr + COUT, off, C, mm, m2base, mp, nrv)
         out_v = acc_a + (a20 * vm + a21 * v0 + a22 * vp)
         acc_a = acc_b + (a10 * vm + a11 * v0 + a12 * vp)
         acc_b = a00 * vm + a01 * v0 + a02 * vp
         res = out_v + bias
         if GATE:
-            um, u0, up = _row3(X, rb_ptr + COUT, xs, cs, W, C, m2, 0, 0, 0)
             gout = gacc_a + (g20 * um + g21 * u0 + g22 * up)
             gacc_a = gacc_b + (g10 * um + g11 * u0 + g12 * up)
             gacc_b = g00 * um + g01 * u0 + g02 * up
             if GATE == 2:
                 res = _gelu(res)
             res = res * (gout + gbias)
+            um, u0, up = num, nu0, nup
+        vm, v0, vp = nvm, nv0, nvp
         if ACT:
             res = _gelu(res)
         yo = r - 1
-        sm = m2base & (yo >= y0)
-        tl.store(out_n + (yo * W + xs).to(tl.int64)[:, None] * COUT + cs[None, :],
-                 res.to(OUT.dtype.element_ty), mask=sm)
+        tl.store(out_n + yo.to(tl.int64) * W * COUT + ooff, res.to(OUT.dtype.element_ty), mask=m2base & (yo >= y0))
 
 
 def dwconv(x, wt, bias, kh, kw, dil=1, gate=False, out=None, act=None):
@@ -178,13 +197,14 @@ def dwconv(x, wt, bias, kh, kw, dil=1, gate=False, out=None, act=None):
         cands = []
         for bw, bc, rows, nw in [(32, 32, 16, 4), (32, 64, 16, 4), (16, 64, 32, 4), (64, 32, 16, 4),
                                  (16, 128, 16, 4), (32, 64, 32, 8), (8, 128, 32, 4), (64, 64, 8, 8),
-                                 (16, 32, 32, 2), (32, 32, 64, 4), (16, 32, 64, 4), (16, 64, 64, 4)]:
+                                 (16, 32, 32, 2), (32, 32, 64, 4), (16, 32, 64, 4), (16, 64, 64, 4),
+                                 (32, 64, 64, 4), (16, 64, 64, 2), (8, 64, 64, 2)]:
             cf = dict(BLOCK_W=bw, BLOCK_C=min(bc, triton.next_power_of_2(cout)), ROWS=rows, num_warps=nw)
             if cf not in cands:
                 cands.append(cf)
         # size-bucketed key: new image shapes reuse tuned configs (the 0 keeps the earlier key layout)
         key = ((n * h * w).bit_length(), w.bit_length(), c, min(gate, 1), 0, str(x.dtype)) + ((act,) if act else ())
-        launch(TUNER.pick("dw3x3c", key, cands, launch))
+        launch(TUNER.pick("dw3x3p", key, cands, launch))
         return out
     bc = min(64, triton.next_power_of_2(cout))
     bw = max(8, min(64, 2048 // bc))

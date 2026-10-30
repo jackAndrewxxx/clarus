@@ -67,7 +67,7 @@ intro(inp NCHW fp32, w, b, out_dtype) down(x, w[2C,C,2,2], b, out_dtype)
 up(x, w[C,4C'] (dy,dx,c') order, residual, out_dtype)   ending(x, w, b, inp) -> fp32 NCHW
 
 # Restormer, RRDBNet
-conv3x3(x, w[Co,Ci,3,3], b, act=None|"lrelu", residual, out_scale, up2, out)   # out / x may be channel slices
+conv3x3(x, w[Co,Ci,3,3], b, act=None|"lrelu", residual, out_scale, up2, out, slope)   # out / x may be channel slices
 pixel_shuffle(x) / pixel_unshuffle(x, r)   add_scaled(a, b, alpha, out)
 channel_attention(qkv, heads, temperature) -> fp32 [N, heads, c, c]   # Restormer MDTA map
 linear_per_image(x, w[N,K,Nout], residual, bias)                       # per-image GEMM

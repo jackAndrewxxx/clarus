@@ -18,12 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .spatial import _gelu as gelu  # exact-erf GELU with a fast erf
 from .tuning import TUNER, cfg, p2
-
-
-@triton.jit
-def gelu(x):
-    return 0.5 * x * (1.0 + tl.erf(x * 0.7071067811865476))
 
 
 @triton.jit
@@ -177,6 +173,54 @@ def fused_gemm_kernel(
 
 
 @triton.jit
+def gemm_wide_kernel(A, B, C, BIAS, SCALE, R, M, N, K, ln_eps, LDA,
+                     PRO: tl.constexpr, GATE: tl.constexpr, ACT: tl.constexpr, HAS_BIAS: tl.constexpr,
+                     HAS_SCALE: tl.constexpr, HAS_RES: tl.constexpr,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    """Short-K GEMM (K <= BLOCK_K) whose program owns BLOCK_M full output rows: the A tile is
+    loaded and normalized (PRO 4 LayerNorm / 6 RMS norm / 0 none) once and kept in registers
+    while the loop walks over all N columns. The tiled kernel re-reads and re-normalizes A for
+    every N tile, which made wide-N projections (qkv, FFN in) 2-3x slower than their bandwidth."""
+    rm = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    rk = tl.arange(0, BLOCK_K)
+    mm = rm < M
+    km = rk < K
+    am = mm[:, None] & km[None, :]
+    rm64 = rm.to(tl.int64)
+    a = tl.load(A + rm64[:, None] * LDA + rk[None, :], mask=am, other=0.0).to(tl.float32)
+    if PRO == 4:
+        mu = tl.sum(a, axis=1) / K
+        a = tl.where(am, a - mu[:, None], 0.0)
+        a = a * tl.rsqrt(tl.sum(a * a, axis=1) / K + ln_eps)[:, None]
+    elif PRO == 6:
+        a = a * tl.rsqrt(tl.sum(a * a, axis=1) / K + ln_eps)[:, None]
+    a = a.to(B.dtype.element_ty)
+    LDB = 2 * N if GATE else N
+    rn0 = tl.arange(0, BLOCK_N)
+    for n0 in range(0, N, BLOCK_N):
+        rn = n0 + rn0
+        nm = rn < N
+        bm = km[:, None] & nm[None, :]
+        acc = tl.dot(a, tl.load(B + rk[:, None] * LDB + rn[None, :], mask=bm, other=0.0))
+        if HAS_BIAS:
+            acc += tl.load(BIAS + rn, mask=nm, other=0.0)[None, :]
+        if GATE:
+            acc2 = tl.dot(a, tl.load(B + rk[:, None] * LDB + N + rn[None, :], mask=bm, other=0.0))
+            if HAS_BIAS:
+                acc2 += tl.load(BIAS + N + rn, mask=nm, other=0.0)[None, :]
+            acc = acc * acc2
+        if ACT == 1:
+            acc = gelu(acc)
+        if HAS_SCALE:
+            acc = acc * tl.load(SCALE + rn, mask=nm, other=0.0)[None, :]
+        cm = mm[:, None] & nm[None, :]
+        c_off = rm64[:, None] * N + rn[None, :]
+        if HAS_RES:
+            acc += tl.load(R + c_off, mask=cm, other=0.0).to(tl.float32)
+        tl.store(C + c_off, acc.to(C.dtype.element_ty), mask=cm)
+
+
+@triton.jit
 def row_stats_kernel(X, OUT, M, K, eps, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
     """Exact two-pass mean / rstd of each row of X[M, K] (K <= BLOCK_K)."""
     rm = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -247,6 +291,10 @@ def fused_gemm(a, b, *, n, k, m, out, bias=None, scale=None, residual=None, smal
     h, w, oh, ow, pt, pl = geom
     if pro == 1 and k <= 128:
         pro = 4
+    if (pro in (0, 4, 6) and a_mode == 0 and c_mode == 0 and k <= 128 and a.dtype != torch.float32
+            and n > 64 and small is None and stats is None and m2 is None):
+        return _gemm_wide(a, b, n=n, k=k, m=m, out=out, bias=bias, scale=scale, residual=residual, ln_eps=ln_eps,
+                          lda=lda, pro=pro, gate=gate, act=act)
     if pro == 0 and a.dtype == torch.float32:
         a_scale = 1.0 / 256.0
     args = (
@@ -276,4 +324,32 @@ def fused_gemm(a, b, *, n, k, m, out, bias=None, scale=None, residual=None, smal
     key = (m.bit_length(), n, k, pro, a_mode, c_mode, 0, int(gate), act, 0, str(b.dtype))
     cands = _candidates(m, n, k, gate, -1 if a_mode else pro, c_mode)
     launch(TUNER.pick("gemm2", key, cands, launch))
+    return out
+
+
+def _gemm_wide(a, b, *, n, k, m, out, bias, scale, residual, ln_eps, lda, pro, gate, act):
+    dummy = out
+    bk = max(16, p2(k))
+    bn_max = max(16, min(256, p2(n)))
+
+    def launch(c):
+        gemm_wide_kernel[(triton.cdiv(m, c["BLOCK_M"]),)](
+            a, b, out, bias if bias is not None else dummy, scale if scale is not None else dummy,
+            residual if residual is not None else dummy, m, n, k, float(ln_eps), int(lda if lda is not None else k),
+            PRO=pro, GATE=gate, ACT=act, HAS_BIAS=bias is not None, HAS_SCALE=scale is not None,
+            HAS_RES=residual is not None, BLOCK_M=c["BLOCK_M"], BLOCK_N=c["BLOCK_N"], BLOCK_K=bk,
+            num_warps=c["num_warps"], num_stages=c["num_stages"])
+
+    cands = []
+    for bm, bn, nw, st in [(128, 128, 4, 2), (64, 64, 2, 2), (64, 128, 4, 2), (128, 64, 8, 2), (64, 64, 4, 2),
+                           (128, 128, 8, 2), (64, 128, 8, 2), (32, 64, 2, 2), (128, 64, 4, 3), (32, 128, 4, 2),
+                           (256, 64, 8, 2), (64, 256, 8, 2), (128, 32, 4, 3), (64, 32, 2, 3)]:
+        if gate and bm * bn > 128 * 64:
+            continue
+        c = dict(BLOCK_M=bm, BLOCK_N=min(bn, bn_max), num_warps=nw, num_stages=st)
+        if c not in cands:
+            cands.append(c)
+    key = (m.bit_length(), n, k, pro, int(gate), act, int(bias is not None), int(scale is not None),
+           int(residual is not None), str(b.dtype))
+    launch(TUNER.pick("gemm_wide3", key, cands, launch))
     return out

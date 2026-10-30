@@ -13,7 +13,7 @@ NAFNetLocal family, no code changes), Restormer, Real-ESRGAN (RRDBNet), FFTforme
 New networks plug in as Python classes, and new hardware starts on the PyTorch backend and
 gains fast kernels one operator at a time.
 
-- **6.5–7.8× faster end to end** than each model's official test script on one A30, with the same PSNR / SSIM
+- **7.2–8.4× faster end to end** than each model's official test script on one A30, with the same PSNR / SSIM
 - **Rust core**: YAML config, PNG IO thread pool (`png` + `rayon`), shape-bucketed scheduler, PyO3 host
 - **Per-operator backend dispatch**: Triton → PyTorch fallback, mixable op by op, fallbacks reported every run
 - **Static mode**: fixed shapes and batch sizes, all device graphs captured at start-up, bit-reproducible batching
@@ -39,15 +39,15 @@ unchanged; times are process start to last result.
 
 | model (task) | data | official script | official | clarus | speed-up | quality, official → clarus |
 |---|---|---|---|---|---|---|
-| NAFNet-GoPro-width64 (deblur) | GoPro test, 1111 × 720p | `basicsr/test.py` (fp32) | 517.9 s | 67.4 s (`eval`) | **7.7×** | PSNR / SSIM 33.7103 / 0.9668 → 33.7103 / 0.9668 |
-| Restormer (motion deblur) | GoPro test, 1111 × 720p | `Motion_Deblurring/test.py` (fp32, writes PNGs) | 1802.1 s | 276.1 s (`infer --save`) | **6.5×** | PSNR 32.9177 → 32.9177; 0.9% of pixels differ, by ≤ 2 levels |
-| FFTformer (deblur) | GoPro test, 1111 × 720p | `test.py` (fp32, writes PNGs) | 2743.9 s | 403.9 s (`eval --save`) | **6.8×** | PSNR / SSIM 34.2115 / 0.9694 → 34.2113 / 0.9694; 1.2% of pixels differ, by ≤ 5 levels |
-| EVSSM (deblur, Mamba) | GoPro test, 1111 × 720p | `test.py` (fp32, mamba_ssm CUDA scan, writes PNGs) | 3972 s | 506.3 s (`eval --save`) | **7.8×** | PSNR / SSIM 34.5106 / 0.9713 → 34.5103 / 0.9713; 2.4% of pixels differ, by ≤ 4 levels |
-| Real-ESRGAN x4plus (×4 SR) | Urban100 LR×4, 100 images in 37 sizes | `inference_realesrgan.py` (fp16 by default) | 20.7 s | 13.0 s (`infer --save`) | **1.6×** | PSNR vs HR 21.0561 → 21.0568; closer to an fp32 reference than the official fp16 run (5.2% vs 7.2% of pixels differ) |
+| NAFNet-GoPro-width64 (deblur) | GoPro test, 1111 × 720p | `basicsr/test.py` (fp32) | 517.9 s | 65.5 s (`eval`) | **7.9×** | PSNR / SSIM 33.7103 / 0.9668 → 33.7103 / 0.9668 |
+| Restormer (motion deblur) | GoPro test, 1111 × 720p | `Motion_Deblurring/test.py` (fp32, writes PNGs) | 1802.1 s | 227.1 s (`infer --save`) | **7.9×** | PSNR 32.9177 → 32.9177; 0.9% of pixels differ, by ≤ 2 levels |
+| FFTformer (deblur) | GoPro test, 1111 × 720p | `test.py` (fp32, writes PNGs) | 2743.9 s | 381.4 s (`eval --save`) | **7.2×** | PSNR / SSIM 34.2115 / 0.9694 → 34.2113 / 0.9694; 1.2% of pixels differ, by ≤ 5 levels |
+| EVSSM (deblur, Mamba) | GoPro test, 1111 × 720p | `test.py` (fp32, mamba_ssm CUDA scan, writes PNGs) | 3972 s | 473.0 s (`eval --save`) | **8.4×** | PSNR / SSIM 34.5106 / 0.9713 → 34.5103 / 0.9713; 2.4% of pixels differ, by ≤ 4 levels |
+| Real-ESRGAN x4plus (×4 SR) | Urban100 LR×4, 100 images in 37 sizes | `inference_realesrgan.py` (fp16 by default) | 20.7 s | 12.0 s (`infer --save`) | **1.7×** | PSNR vs HR 21.0561 → 21.0568; closer to an fp32 reference than the official fp16 run (5.2% vs 7.2% of pixels differ) |
 
-Single forward pass (batch 1): NAFNet 720p 251.0 → 54.8 ms; Restormer 720p 1482 → 238 ms;
-RRDBNet at 256×384 input 250 (official fp32) / 167 (official fp16) → 116 ms; FFTformer 720p
-2030 → 349 ms; EVSSM 720p 3149 → 433 ms. FFTformer / EVSSM PSNR / SSIM above are both
+Single forward pass (batch 1): NAFNet 720p 251.0 → 53.3 ms; Restormer 720p 1482 → 199 ms;
+RRDBNet at 256×384 input 250 (official fp32) / 167 (official fp16) → 84 ms; FFTformer 720p
+2030 → 330 ms; EVSSM 720p 3149 → 407 ms. FFTformer / EVSSM PSNR / SSIM above are both
 measured with `tools/score_outputs.py` on the saved PNGs (`clarus eval` itself reports
 34.2113 / 0.9692 and 34.5103 / 0.9711; the SSIM gap is basicsr's TF32 SSIM on the GPU).
 Real-ESRGAN gains least: its 3×3 convolutions are already cuDNN-fp16 territory, and clarus

@@ -85,6 +85,18 @@ Validate with `tools/parity.py --device <dev> --backends torch` and a small
 5. Measure with `tools/kernel_breakdown.py --config ...` (per-launch time, TF/s, GB/s)
    and `tools/bench_model.py --graph`.
 
+Triton lessons from tuning the existing kernels (each one was a measured win or loss):
+- Keep the main loop one flat `range` over all (tap, K-chunk) steps: a static loop over the 9
+  taps with a one-iteration inner loop gave the pipeliner (`num_stages`) nothing to overlap
+  (conv3x3: -28% on Real-ESRGAN once flattened).
+- For short-K / wide-N GEMMs (qkv, FFN in), let one program own full rows and loop over N
+  (`gemm_wide_kernel`): the tiled kernel re-read and re-normalized A once per N tile (Restormer
+  qkv 2.8 -> 1.4 ms).
+- `tl.erf` (libdevice) is costly in elementwise-bound kernels; `_gelu` in `kernels/spatial.py`
+  uses an erf with < 1.5e-7 error, far below the fp16 output precision.
+- Stencil reads inside a GEMM (depthwise conv fused into the next 1x1) were 3x slower than the
+  two kernels: per-element address / mask math dominates. Measure before fusing.
+
 ## 4. Other frameworks (TensorRT, ONNX Runtime, MindSpore, ...)
 
 Treat the framework as a backend for the whole model rather than per op:

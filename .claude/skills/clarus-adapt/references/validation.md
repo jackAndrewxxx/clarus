@@ -26,11 +26,11 @@ Reference numbers on one A30 (GoPro test, 1111 images, 1280x720):
 
 | config | PSNR / SSIM | throughput | original basicsr/test.py |
 |---|---|---|---|
-| `nafnet_gopro_width64.yaml` | 33.7103 / 0.9668 (official 33.7103 / 0.9668) | 57.6 ms/img, 67.4 s end to end | official repo test.py 517.9 s |
-| `restormer_motion_deblurring.yaml` | 32.9177 / 0.9611 (official outputs 32.9177 / 0.9613) | 244.7 ms/img, 276.1 s infer+save | official test.py 1802.1 s |
-| `fftformer_gopro.yaml` | 34.2113 / 0.9692 (official outputs, same tool: 34.2115 / 0.9694 vs ours 34.2113 / 0.9694) | 349 ms forward, 403.9 s eval+save | official test.py 2743.9 s |
-| `evssm_gopro.yaml` | 34.5103 / 0.9711 (official outputs, same tool: 34.5106 / 0.9713 vs ours 34.5103 / 0.9713) | 433 ms forward, 506.3 s eval+save | official test.py 3972 s |
-| `realesrgan_x4plus.yaml` (Urban100 x4) | PSNR vs HR 21.0568 (official fp16 21.0561) | 13.0 s infer+save, 100 images | official inference (fp16) 20.7 s |
+| `nafnet_gopro_width64.yaml` | 33.7103 / 0.9668 (official 33.7103 / 0.9668) | 53.3 ms forward, 65.5 s end to end | official repo test.py 517.9 s |
+| `restormer_motion_deblurring.yaml` | 32.9177 / 0.9611 (official outputs 32.9177 / 0.9613) | 199 ms forward, 227.1 s infer+save | official test.py 1802.1 s |
+| `fftformer_gopro.yaml` | 34.2113 / 0.9692 (official outputs, same tool: 34.2115 / 0.9694 vs ours 34.2113 / 0.9694) | 330 ms forward, 381.4 s eval+save | official test.py 2743.9 s |
+| `evssm_gopro.yaml` | 34.5103 / 0.9711 (official outputs, same tool: 34.5106 / 0.9713 vs ours 34.5103 / 0.9713) | 407 ms forward, 473.0 s eval+save | official test.py 3972 s |
+| `realesrgan_x4plus.yaml` (Urban100 x4) | PSNR vs HR 21.0568 (official fp16 21.0561) | 84 ms forward at 256x384, 12.0 s infer+save, 100 images | official inference (fp16) 20.7 s |
 
 Performance workflow: `tools/bench_model.py --config CFG --graph` gives forward latency,
 and `tools/kernel_breakdown.py --config CFG` gives per-launch time with TF/s and GB/s

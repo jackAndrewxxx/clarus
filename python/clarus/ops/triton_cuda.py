@@ -126,13 +126,13 @@ class TritonOps(Backend):
                           residual=inp.contiguous(), out_dtype=torch.float32, nchw_out=True)
 
     def conv3x3(self, x, w, b=None, out_dtype=None, act=None, residual=None, out_scale=1.0, up2=False,
-                out=None):
+                out=None, slope=0.2):
         if act not in (None, "lrelu") or tuple(w.shape[-2:]) != (3, 3) or w.shape[1] != x.shape[-1]:
             raise Unsupported("conv3x3 kernel: 3x3, activation none / lrelu")
         bias = b if b is not None else self.cached(w, "zbias", lambda t: torch.zeros(t.shape[0], device=t.device))
         return kc.conv3x3(x, self._kn(w, pad=True), bias.float().contiguous(), cout=w.shape[0], residual=residual,
                           out=out, out_dtype=out_dtype or self.dtype, act=1 if act == "lrelu" else 0,
-                          out_scale=out_scale, up2=up2)
+                          out_scale=out_scale, up2=up2, slope=slope)
 
     def channel_attention(self, qkv, heads, temperature):
         if not qkv.is_contiguous():

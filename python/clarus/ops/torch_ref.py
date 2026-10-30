@@ -176,10 +176,10 @@ class TorchOps(Backend):
 
     # ------------------------------------------------- generic ops (Restormer, SR, ...)
     def conv3x3(self, x, w, b=None, out_dtype=None, act=None, residual=None, out_scale=1.0, up2=False,
-                out=None):
+                out=None, slope=0.2):
         """Dense 3x3 conv, stride 1, 'same' padding: NHWC -> NHWC; w [Cout, Cin, 3, 3].
 
-        y = act(conv(up(x)) + b) * out_scale (+ residual); act: None | "lrelu" (LeakyReLU 0.2);
+        y = act(conv(up(x)) + b) * out_scale (+ residual); act: None | "lrelu" (LeakyReLU, negative `slope`);
         up2: nearest x2 upsample of x first. `out` may be a channel slice of a wider buffer
         (written in place and returned), and so may `x` / `residual`.
         """
@@ -188,7 +188,7 @@ class TorchOps(Backend):
             xi = F.interpolate(xi, scale_factor=2, mode="nearest")
         y = F.conv2d(xi, w.float(), b, padding=1).permute(0, 2, 3, 1)
         if act == "lrelu":
-            y = F.leaky_relu(y, 0.2)
+            y = F.leaky_relu(y, slope)
         if out_scale != 1.0:
             y = y * out_scale
         if residual is not None:
