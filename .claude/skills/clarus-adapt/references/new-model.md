@@ -8,8 +8,9 @@
    With `arch_from`, keys in `model.network_g` override single keys. Take the network from
    the *training* yml: test ymls can drift (other checkpoint, other options).
 3. Unsupported options fail at load with a message naming the option. A checkpoint /
-   config mismatch fails in weight folding, either with "checkpoint has no tensor ..."
-   or "tensors not consumed ...".
+   config mismatch fails at load in the exact key / shape check, listing missing,
+   unexpected and mis-shaped tensors. `model.params_key` picks the weights inside a basicsr
+   checkpoint (default: the family's `PARAMS_KEYS` order, e.g. `params_ema` first for RRDBNet).
 4. Validate (see validation.md): `tools/parity.py --config configs/<name>.yaml`, then a
    full `clarus eval --config ...` compared with the official outputs or the training log.
 
@@ -26,7 +27,13 @@ any width, block counts and number of levels, TLC with any `train_size` (not `fa
 3. Constructor `(cfg, ops, device, dtype)`:
    - parse the architecture from `cfg` (`network_g` / `arch_from`, or your own keys)
      and reject unsupported options explicitly;
-   - load the checkpoint and **fold once**: fold norm affines into the following linear
+   - load the checkpoint with `_fold.load_checkpoint(cfg, PARAMS_KEYS)` (define a module-level
+     `PARAMS_KEYS`; the reference tools load the same tensors through it), then validate it
+     with `_fold.check_state_dict(sd, {key: shape})` built from the parsed architecture, so a
+     wrong `network_g` fails at load instead of silently running the checkpoint's shapes;
+   - reject input sizes the official code cannot handle (e.g. reflect padding wider than
+     the image: `_fold.check_reflect_pad`) with the minimum size in the message;
+   - **fold once**: fold norm affines into the following linear
      ops, merge consecutive linear maps, drop training-only heads, and convert to the
      canonical layout (references/architecture.md). Keep tiny scale vectors in fp32;
    - set `self.io = IOSpec(in_channels, out_channels, scale, pad_multiple)`.

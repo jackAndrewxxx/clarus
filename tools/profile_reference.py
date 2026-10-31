@@ -23,6 +23,7 @@ def build_reference():
 def main():
     torch.backends.cudnn.benchmark = True
     net = build_reference()
+    print(net.describe(), flush=True)
     x = torch.rand(1, 3, 720, 1280, device="cuda")
     with torch.no_grad():
         for _ in range(3):

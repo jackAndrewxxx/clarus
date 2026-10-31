@@ -10,7 +10,8 @@ CLARUS_NAFNET_REPO: a clone of megvii-research/NAFNet. CLARUS_RESTORMER_REPO: a 
 the pip `basicsr` package (for basicsr.archs.rrdbnet_arch). CLARUS_FFTFORMER_REPO /
 CLARUS_EVSSM_REPO: clones of kkkls/FFTformer and kkkls/EVSSM (EVSSM also needs `mamba_ssm`
 importable; CLARUS_MAMBA_PIP may name a directory that contains it). A family is skipped when
-its reference is not available.
+its reference is not configured. Each case prints which backend served how many ops; a
+triton-labelled case fails if no op ran on triton. Exit code 1 on any failure or if no case passed.
 """
 from __future__ import annotations
 
@@ -106,11 +107,51 @@ def ref_class(kind):
     return importlib.import_module("basicsr.archs.rrdbnet_arch").RRDBNet
 
 
-def run(kind, variants, model_name, dev, hw, ok_all):
-    cls = ref_class(kind)
+CASES = (("torch/fp32", dict(backends=["torch"], dtype="fp32"), "torch", 1e-4),
+         ("triton,torch/fp16", dict(backends=["triton", "torch"], dtype="fp16"), "triton", 2e-2))
+
+
+def backend_coverage(ops):
+    """-> {backend: sorted ops it served} from the dispatcher's eager-call counters."""
+    cov: dict = {}
+    for op, by in ops.report()["ops"].items():
+        for b in by:
+            cov.setdefault(b, []).append(op)
+    return {b: sorted(v) for b, v in sorted(cov.items())}
+
+
+def run_case(label, kw2, want, tol, cfg, x, y_ref):
+    """-> (ok, message). A case labelled with a fast backend fails if that backend served no op."""
+    model, ops, _ = build_from_config(cfg, **kw2)
+    y = model.forward(x)
+    if y.shape != y_ref.shape:
+        return False, f"{label}: shape {tuple(y.shape)} != reference {tuple(y_ref.shape)} BAD"
+    rel = (y.float() - y_ref).abs().max().item() / y_ref.abs().max().item()
+    cov = backend_coverage(ops)
+    ok = rel < tol
+    msg = f"{label}: rel {rel:.1e}"
+    if want not in cov:
+        ok = False
+        why = ops.skipped.get(want, "no op dispatched to it")
+        msg += f" NO OP RAN ON {want} ({why})"
+    msg += " OK" if ok else " BAD"
+    msg += " [" + "; ".join(f"{b}: {len(v)} ops" for b, v in cov.items()) + "]"
+    if want != "torch" and "torch" in cov:
+        msg += f" (torch: {', '.join(cov['torch'])})"
+    return ok, msg
+
+
+def run(kind, variants, model_name, dev, hw, counts):
+    try:
+        cls = ref_class(kind)
+    except Exception as e:  # configured but not importable: a failure, not a skip
+        print(f"FAIL {kind}: cannot import the reference: {type(e).__name__}: {e}")
+        counts["fail"] += len(variants) * len(CASES)
+        return
     if cls is None:
-        print(f"skip {kind}: reference not configured")
-        return ok_all
+        print(f"skip {kind}: reference not configured ({len(variants) * len(CASES)} cases)")
+        counts["skip"] += len(variants) * len(CASES)
+        return
     tmp = tempfile.mkdtemp(prefix=f"clarus_{kind}_")
     for name, net_g in variants.items():
         kw = {k: v for k, v in net_g.items() if k != "type"}
@@ -128,20 +169,15 @@ def run(kind, variants, model_name, dev, hw, ok_all):
         x = torch.rand(2 if kind != "evssm" else 1, 3, *hw, device=dev)   # EVSSM's crop code needs batch 1
         with torch.no_grad():
             y_ref = ref(x)
-        scale = y_ref.abs().max().item()
         line = [f"{name:22s}"]
-        for label, kw2 in (("torch/fp32", dict(backends=["torch"], dtype="fp32")),
-                           ("triton,torch/fp16", dict(backends=["triton", "torch"], dtype="fp16"))):
-            model, ops, _ = build_from_config(cfg, **kw2)
-            y = model.forward(x)
-            rel = (y.float() - y_ref).abs().max().item() / scale
-            tol = 1e-4 if label.startswith("torch") else 2e-2
-            ok = rel < tol and y.shape == y_ref.shape
-            ok_all &= ok
-            fb = sorted(op for op, by in ops.report()["ops"].items() if "torch" in by and ops.backends[0].name != "torch")
-            line.append(f"{label}: rel {rel:.1e} {'OK' if ok else 'BAD'}" + (f" (torch: {', '.join(fb)})" if fb else ""))
+        for label, kw2, want, tol in CASES:
+            try:
+                ok, msg = run_case(label, kw2, want, tol, cfg, x, y_ref)
+            except Exception as e:
+                ok, msg = False, f"{label}: ERROR {type(e).__name__}: {e}"
+            counts["pass" if ok else "fail"] += 1
+            line.append(msg)
         print(" | ".join(line), flush=True)
-    return ok_all
 
 
 def main():
@@ -150,12 +186,17 @@ def main():
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    ok = run("nafnet", NAFNET, "nafnet", args.device, (75, 101), True)        # first: its basicsr is a namespace pkg
-    ok = run("restormer", RESTORMER, "restormer", args.device, (64, 96), ok)   # Restormer needs H, W % 8 == 0
-    ok = run("rrdbnet", RRDB, "rrdbnet", args.device, (36, 52), ok)
-    ok = run("fftformer", FFTFORMER, "fftformer", args.device, (64, 96), ok)  # sizes the reference accepts as is
-    ok = run("evssm", EVSSM, "evssm", args.device, (64, 96), ok)
-    print("ALL OK" if ok else "FAILED")
+    counts = {"pass": 0, "fail": 0, "skip": 0}
+    run("nafnet", NAFNET, "nafnet", args.device, (75, 101), counts)        # first: its basicsr is a namespace pkg
+    run("restormer", RESTORMER, "restormer", args.device, (64, 96), counts)   # Restormer needs H, W % 8 == 0
+    run("rrdbnet", RRDB, "rrdbnet", args.device, (36, 52), counts)
+    run("fftformer", FFTFORMER, "fftformer", args.device, (64, 96), counts)  # sizes the reference accepts as is
+    run("evssm", EVSSM, "evssm", args.device, (64, 96), counts)
+    print(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped")
+    if counts["fail"] or not counts["pass"]:
+        print("FAILED" + ("" if counts["pass"] else " (no case ran)"))
+        sys.exit(1)
+    print("OK" + (f" ({counts['skip']} cases skipped: their references are not configured)" if counts["skip"] else ""))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 """Latency benchmark of the runtime model forward (dev tool).
 
   python tools/bench_model.py [--config CFG] [--backends triton,torch] [--graph] [--batch 1] [--prof]
+
+Runs on any clarus device (python/clarus/device); --graph needs one that supports graph capture.
 """
 from __future__ import annotations
 
@@ -23,41 +25,42 @@ def main():
     torch.backends.cudnn.benchmark = True
     h, w = map(int, args.hw.split(","))
     net, ops, dev = build_engine_model(args)
+    if args.graph and not dev.supports_graphs:
+        raise SystemExit(f"--graph: device {dev.name()} does not support graph capture")
     x = torch.rand(args.batch, 3, h, w, device=dev.torch_device)
     fn = net.forward
     for _ in range(3):
         fn(x)
-    torch.cuda.synchronize()
+    dev.synchronize()
     if args.graph:
-        g = torch.cuda.CUDAGraph()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
+        stream = dev.new_stream()
+        with dev.stream_ctx(stream):      # warm up on the capture stream
             fn(x)
-        torch.cuda.current_stream().wait_stream(s)
-        with torch.cuda.graph(g):
-            y = fn(x)
-        run = g.replay
+        dev.synchronize()
+        run = dev.capture(lambda: fn(x), stream, dev.graph_pool())
     else:
         def run():
             fn(x)
     for _ in range(3):
         run()
-    torch.cuda.synchronize()
+    dev.synchronize()
     t = time.perf_counter()
     for _ in range(args.iters):
         run()
-    torch.cuda.synchronize()
+    dev.synchronize()
     dt = (time.perf_counter() - t) / args.iters
-    print(f"{ops.report()['backends']}/{ops.dtype} B={args.batch} {h}x{w} graph={args.graph}: "
+    mem = dev.max_memory_gib()
+    print(f"{dev.name()} {ops.report()['backends']}/{ops.dtype} B={args.batch} {h}x{w} graph={args.graph}: "
           f"{dt * 1000:.2f} ms/batch, {dt * 1000 / args.batch:.2f} ms/img, "
-          f"peak mem {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+          f"peak mem {f'{mem:.2f} GiB' if mem is not None else 'n/a'}")
     if args.prof:
         from torch.profiler import ProfilerActivity, profile
-        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        cuda = dev.torch_device.type == "cuda"
+        with profile(activities=[ProfilerActivity.CUDA if cuda else ProfilerActivity.CPU]) as prof:
             fn(x)
-            torch.cuda.synchronize()
-        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=40, max_name_column_width=70))
+            dev.synchronize()
+        print(prof.key_averages().table(sort_by="cuda_time_total" if cuda else "cpu_time_total",
+                                        row_limit=40, max_name_column_width=70))
 
 
 if __name__ == "__main__":

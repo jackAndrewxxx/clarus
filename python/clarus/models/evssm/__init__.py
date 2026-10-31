@@ -2,6 +2,7 @@
 
 model config keys:
   checkpoint:  official .pth (`params`, e.g. net_g_GoPro.pth)
+  params_key:  state-dict key in the checkpoint (default: params, then params_ema)
   network_g:   {type: EVSSM, dim, num_blocks, ffn_expansion_factor, bias}
 
 Every EVS block re-orients the feature map (transpose for even block index, 180-degree flip for
@@ -9,20 +10,66 @@ odd), splits it into overlapping k x k crops (k = 384 / 192 / 96 per level), run
 selective scan (Mamba) over each crop's raster sequence and averages the crops back. Here the
 orientation is folded into the crop gather / merge addressing, the norm affine into in_proj,
 and out_norm + `* gelu(z)` into the out_proj GEMM prologue. The input is reflect-padded to a
-multiple of 4 (the official network requires it).
+multiple of 4 (the official network requires it). H, W must be >= MIN_SIZE: every EDFFN
+reflect-pads its feature map to a multiple of 8, which PyTorch (and so upstream) rejects once
+the quarter-resolution map is 4 pixels or smaller.
 """
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
 
 from .. import IOSpec, RestorationModel, register_model
-from .._fold import Folder, kn, ln_fold, load_state_dict, resolve_network_g
+from .._fold import Folder, check_state_dict, kn, ln_fold, load_checkpoint, resolve_network_g
 from ...ops.torch_ref import grid_tiles
 
 DEFAULTS = dict(inp_channels=3, out_channels=3, dim=48, num_blocks=[6, 6, 12], num_refinement_blocks=4,
                 ffn_expansion_factor=3, bias=False)
 PATCH = (384, 192, 96)  # crop size per pyramid level (hard-coded upstream)
+PARAMS_KEYS = ("params", "params_ema")
+MIN_SIZE = 17           # padded to 20 -> quarter-resolution map 5 >= the 3-pixel reflect pad to 8
+
+
+def _conv(s, name, co, ci, k, bias):
+    s[f"{name}.weight"] = (co, ci, k, k)
+    if bias:
+        s[f"{name}.bias"] = (co,)
+
+
+def state_dict_shapes(net):
+    """Exact {key: shape} of the upstream EVSSM state dict (SS2D: d_state 8, expand 2, no
+    in / out_proj bias, conv bias; num_refinement_blocks is unused upstream)."""
+    d, nb, ffn, b = net["dim"], net["num_blocks"], net["ffn_expansion_factor"], net["bias"]
+    s = {}
+    for name, n, lvl in (("encoder_level1", nb[0], 0), ("encoder_level2", nb[1], 1), ("encoder_level3", nb[2], 2),
+                         ("decoder_level3", nb[2], 2), ("decoder_level2", nb[1], 1), ("decoder_level1", nb[0], 0)):
+        c = d * 2 ** lvl
+        di, r, hid = 2 * c, math.ceil(c / 16), int(c * ffn)
+        for i in range(n):
+            p, a = f"{name}.block{i}", f"{name}.block{i}.attn"
+            for nm in ("norm1", "norm2"):
+                s[f"{p}.{nm}.body.weight"] = s[f"{p}.{nm}.body.bias"] = (c,)
+            s[f"{a}.in_proj.weight"] = (2 * di, c)
+            _conv(s, f"{a}.conv2d", di, 1, 3, True)
+            s[f"{a}.x_proj_weight"] = (1, r + 16, di)
+            s[f"{a}.x_conv.weight"], s[f"{a}.x_conv.bias"] = (r + 16, 1, 7), (r + 16,)
+            s[f"{a}.dt_projs_weight"], s[f"{a}.dt_projs_bias"] = (1, di, r), (1, di)
+            s[f"{a}.A_logs"], s[f"{a}.Ds"] = (di, 8), (di,)
+            s[f"{a}.out_norm.weight"] = s[f"{a}.out_norm.bias"] = (di,)
+            s[f"{a}.out_proj.weight"] = (c, di)
+            _conv(s, f"{p}.ffn.project_in", 2 * hid, c, 1, b)
+            _conv(s, f"{p}.ffn.dwconv", 2 * hid, 1, 3, b)
+            s[f"{p}.ffn.fft"] = (c, 1, 1, 8, 5)
+            _conv(s, f"{p}.ffn.project_out", c, hid, 1, b)
+    _conv(s, "patch_embed.proj", d, 3, 3, False)
+    for name, c in (("down1_2", d), ("down2_3", 2 * d)):
+        _conv(s, f"{name}.body.1", 2 * c, c, 3, False)
+    for name, c in (("up3_2", 4 * d), ("up2_1", 2 * d)):
+        _conv(s, f"{name}.body.1", c // 2, c, 3, False)
+    _conv(s, "output", 3, d, 3, b)
+    return s
 
 
 @register_model("evssm")
@@ -36,7 +83,9 @@ class EVSSM(RestorationModel):
         if net["inp_channels"] != 3 or net["out_channels"] != 3:
             raise ValueError("EVSSM: only 3-channel in / out is supported")
         self.net_cfg = net
-        f = Folder(load_state_dict(cfg), device, dtype)
+        self.params_key, sd = load_checkpoint(cfg, PARAMS_KEYS)
+        check_state_dict(sd, state_dict_shapes(net), "EVSSM network_g")
+        f = Folder(sd, device, dtype)
         d, nb = net["dim"], net["num_blocks"]
         self.stages = [("encoder_level1", nb[0], 0), ("encoder_level2", nb[1], 1), ("encoder_level3", nb[2], 2),
                        ("decoder_level3", nb[2], 2), ("decoder_level2", nb[1], 1), ("decoder_level1", nb[0], 0)]
@@ -119,6 +168,9 @@ class EVSSM(RestorationModel):
         o, w = self.ops, self.w
         n, _, h, wd = inp.shape
         ph, pw = (4 - h % 4) % 4, (4 - wd % 4) % 4
+        if min(h, wd) < MIN_SIZE:
+            raise ValueError(f"EVSSM: input {h}x{wd} is too small: the official network reflect-pads every "
+                             f"feature map to a multiple of 8, which needs H and W >= {MIN_SIZE}")
         x_in = F.pad(inp, (0, pw, 0, ph), mode="reflect") if (ph or pw) else inp
         e1 = self._stage(o.intro(x_in, w["embed.w"], w["embed.bias"]), "encoder_level1")
         e2 = self._stage(o.conv3x3(o.resize_bilinear(e1, 0.5), w["down1_2.w"]), "encoder_level2")
@@ -132,4 +184,5 @@ class EVSSM(RestorationModel):
     def describe(self):
         d = super().describe()
         d["network_g"] = self.net_cfg
+        d["params_key"] = self.params_key
         return d

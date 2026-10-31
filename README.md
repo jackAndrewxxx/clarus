@@ -45,7 +45,7 @@ unchanged; times are process start to last result.
 | EVSSM (deblur, Mamba) | GoPro test, 1111 × 720p | `test.py` (fp32, mamba_ssm CUDA scan, writes PNGs) | 3972 s | 473.0 s (`eval --save`) | **8.4×** | PSNR / SSIM 34.5106 / 0.9713 → 34.5103 / 0.9713; 2.4% of pixels differ, by ≤ 4 levels |
 | Real-ESRGAN x4plus (×4 SR) | Urban100 LR×4, 100 images in 37 sizes | `inference_realesrgan.py` (fp16 by default) | 20.7 s | 12.0 s (`infer --save`) | **1.7×** | PSNR vs HR 21.0561 → 21.0568; closer to an fp32 reference than the official fp16 run (5.2% vs 7.2% of pixels differ) |
 
-Single forward pass (batch 1): NAFNet 720p 251.0 → 53.3 ms; Restormer 720p 1482 → 199 ms;
+Single forward pass (batch 1): NAFNet 720p 251.0 → 54.3 ms; Restormer 720p 1482 → 199 ms;
 RRDBNet at 256×384 input 250 (official fp32) / 167 (official fp16) → 84 ms; FFTformer 720p
 2030 → 330 ms; EVSSM 720p 3149 → 407 ms. FFTformer / EVSSM PSNR / SSIM above are both
 measured with `tools/score_outputs.py` on the saved PNGs (`clarus eval` itself reports
@@ -346,6 +346,11 @@ drives it without Rust.
 | engine end to end | `python tools/check_engine.py --device N` | `PASS` |
 | per-image vs original pipeline | `tools/reference_eval.py` + `tools/compare_reports.py` | p99 dPSNR < 0.002 dB |
 | Rust unit tests | `cd engine && cargo test --release --offline` | all pass |
+| kernel / op / model / tool contracts | `python tools/test_kernel_contracts.py`, `test_ops_contracts.py`, `test_model_contracts.py`, `test_tools.py`, `worker_smoke.py --selftest` | all pass |
+
+Every tool exits non-zero on a failure, on missing or extra samples, and when nothing was
+checked (e.g. no reference configured). `clarus eval` / `infer` exit 1 when any image failed
+(`--allow-failures` keeps exit 0); the report is written either way.
 
 Commands, thresholds and reference numbers: `.claude/skills/clarus-adapt/references/validation.md`.
 

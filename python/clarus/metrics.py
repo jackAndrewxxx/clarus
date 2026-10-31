@@ -11,7 +11,9 @@ The sum of squared errors is accumulated exactly in integers.
 from __future__ import annotations
 
 import math
+import weakref
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -28,6 +30,30 @@ def gaussian_1d(size: int = 11, sigma: float = 1.5):
     g = [math.exp(-((i - half) ** 2) / (2 * sigma * sigma)) for i in range(size)]
     s = sum(g)
     return [v / s for v in g]
+
+
+def _f64(x) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        return x.detach().to("cpu", torch.float64).numpy()
+    return np.asarray(x, dtype=np.float64)
+
+
+def psnr_peak(pred) -> float:
+    """basicsr's peak rule: 1.0 if pred.max() <= 1 else 255.0 (the device metrics use the same)."""
+    return 1.0 if _f64(pred).max() <= 1 else 255.0
+
+
+def psnr(pred, gt) -> float:
+    """basicsr calculate_psnr(pred, gt, crop_border=0) on host: float64 MSE, peak psnr_peak(pred),
+    inf when identical. pred / gt: numpy arrays or torch tensors (any device, any layout, same
+    shape) holding 0..255 values (uint8 or the rounded float of tensor2img)."""
+    a, b = _f64(pred), _f64(gt)
+    if a.shape != b.shape:
+        raise ValueError(f"shape mismatch {a.shape} vs {b.shape}")
+    mse = np.mean((a - b) ** 2)
+    if mse == 0:
+        return float("inf")
+    return float(20.0 * np.log10(psnr_peak(a) / np.sqrt(mse)))
 
 
 if triton is not None:
@@ -145,48 +171,59 @@ class TritonMetrics:
                 cm[c][min(max(c + t, 0), 2)] += g[t + 5]
         self.g = torch.tensor(g, device=device, dtype=torch.float32)
         self.cm = torch.tensor(cm, device=device, dtype=torch.float32).flatten()
-        self.bufs = {}
+        self.c_hi = torch.tensor([(0.01 * 255) ** 2, (0.03 * 255) ** 2], device=device)
+        self.c_lo = torch.tensor([0.01 ** 2, 0.03 ** 2], device=device)
+        # live scratch per (h, w), shared by the callers that hold it; freed with the last holder
+        self._live = weakref.WeakValueDictionary()
 
-    def _buf(self, h, w):
-        key = (h, w)
-        if key not in self.bufs:
-            n = h * w * 3
-            block = 4096
-            nb = triton.cdiv(n, block)
-            bw = 128
-            nx = triton.cdiv(w, bw)
-            self.bufs[key] = dict(
-                block=block, nb=nb, bw=bw, nx=nx,
-                ssd=torch.empty(nb, device=self.device, dtype=torch.int32),
-                mx=torch.empty(nb, device=self.device, dtype=torch.int32),
-                tmp=torch.empty((5, 3, h, w), device=self.device, dtype=torch.float32),
-                part=torch.empty((h * 3 * nx,), device=self.device, dtype=torch.float32),
-                c_hi=torch.tensor([(0.01 * 255) ** 2, (0.03 * 255) ** 2], device=self.device),
-                c_lo=torch.tensor([0.01 ** 2, 0.03 ** 2], device=self.device),
-            )
-        return self.bufs[key]
+    def scratch(self, h: int, w: int) -> "_Scratch":
+        """Device scratch for [h, w, 3] images (~60 B/pixel). The caller owns it: keep it alive as
+        long as anything (e.g. a captured graph) may use it, pass it to compute(). Callers asking
+        for the same shape while one is alive share it (they must run on one stream)."""
+        s = self._live.get((h, w))
+        if s is None:
+            s = _Scratch(h, w, self.device)
+            self._live[(h, w)] = s
+        return s
 
-    def compute(self, out_u8: torch.Tensor, gt_u8: torch.Tensor, res: torch.Tensor):
+    def compute(self, out_u8: torch.Tensor, gt_u8: torch.Tensor, res: torch.Tensor, scratch=None):
         """out_u8, gt_u8: contiguous [H, W, 3] uint8. Writes res[0] = PSNR, res[1] = SSIM (float64).
 
-        No host synchronization: safe inside CUDA-graph capture.
+        `scratch`: from scratch(H, W); allocated per call when omitted. No host synchronization:
+        safe inside CUDA-graph capture (the graph then references `scratch`, keep it alive).
         """
         h, w, _ = out_u8.shape
-        b = self._buf(h, w)
+        b = scratch if scratch is not None else self.scratch(h, w)
+        if (b.h, b.w) != (h, w):
+            raise ValueError(f"metrics scratch is for {b.h}x{b.w}, image is {h}x{w}")
         n = h * w * 3
-        ssd_max_kernel[(b["nb"],)](out_u8, gt_u8, b["ssd"], b["mx"], n, BLOCK=b["block"], num_warps=8)
-        ssd = b["ssd"].sum(dtype=torch.int64).double()
-        small = b["mx"].max() <= 1
+        ssd_max_kernel[(b.nb,)](out_u8, gt_u8, b.ssd, b.mx, n, BLOCK=b.block, num_warps=8)
+        ssd = b.ssd.sum(dtype=torch.int64).double()
+        small = b.mx.max() <= 1
         maxv = torch.where(small, 1.0, 255.0).double()
         mse = ssd / n
         psnr = 20.0 * torch.log10(maxv / torch.sqrt(mse))
         res[0] = torch.where(mse == 0, torch.full_like(psnr, float("inf")), psnr)
-        cc = torch.where(small, b["c_lo"], b["c_hi"])
-        ssim_h_kernel[(h, triton.cdiv(w, b["bw"]), 3)](out_u8, gt_u8, b["tmp"], self.g, self.cm, h, w,
-                                                       OFF=128.0, BLOCK_W=b["bw"], num_warps=4)
-        part = b["part"]
-        ssim_v_kernel[(h, 3, b["nx"])](b["tmp"], part, self.g, cc, h, w, OFF=128.0, BLOCK_W=b["bw"], num_warps=4)
+        cc = torch.where(small, self.c_lo, self.c_hi)
+        ssim_h_kernel[(h, triton.cdiv(w, b.bw), 3)](out_u8, gt_u8, b.tmp, self.g, self.cm, h, w,
+                                                    OFF=128.0, BLOCK_W=b.bw, num_warps=4)
+        part = b.part
+        ssim_v_kernel[(h, 3, b.nx)](b.tmp, part, self.g, cc, h, w, OFF=128.0, BLOCK_W=b.bw, num_warps=4)
         res[1] = part.double().sum() / n
+
+
+class _Scratch:
+    """TritonMetrics device buffers for one image shape (a class so it can be weakly cached)."""
+
+    def __init__(self, h, w, device):
+        self.h, self.w = h, w
+        self.block, self.bw = 4096, 128
+        self.nb = triton.cdiv(h * w * 3, self.block)
+        self.nx = triton.cdiv(w, self.bw)
+        self.ssd = torch.empty(self.nb, device=device, dtype=torch.int32)
+        self.mx = torch.empty(self.nb, device=device, dtype=torch.int32)
+        self.tmp = torch.empty((5, 3, h, w), device=device, dtype=torch.float32)
+        self.part = torch.empty((h * 3 * self.nx,), device=device, dtype=torch.float32)
 
 
 class TorchMetrics:
@@ -204,7 +241,10 @@ class TorchMetrics:
         self.kh = k.view(1, 1, 1, 11)
         self.kv = k.view(1, 1, 11, 1)
 
-    def compute(self, out_u8, gt_u8, res):
+    def scratch(self, h, w):
+        return None  # works on per-call temporaries
+
+    def compute(self, out_u8, gt_u8, res, scratch=None):
         h, w, _ = out_u8.shape
         n = h * w * 3
         d = out_u8.int() - gt_u8.int()

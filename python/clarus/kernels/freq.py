@@ -111,9 +111,11 @@ def corr_mats(p, device, dtype):
 
 
 @triton.jit
-def _patch_ptrs(n, py, px, H, W, LDX, P: tl.constexpr):
+def _patch_ptrs(n, py, px, LDN, LDH, LDX, P: tl.constexpr):
+    """Element offsets of patch (py, px) of image n; LDN / LDH / LDX are the tensor's batch /
+    row / pixel strides (any values: channel slices, batch slices and expanded batches)."""
     pix = tl.arange(0, P * P)
-    return ((n.to(tl.int64) * H + py * P + pix // P) * W + px * P + pix % P) * LDX
+    return n.to(tl.int64) * LDN + (py * P + pix // P).to(tl.int64) * LDH + (px * P + pix % P).to(tl.int64) * LDX
 
 
 @triton.jit
@@ -123,7 +125,7 @@ def _colnorm(s):
 
 
 @triton.jit
-def patch_corr_kernel(X, TR, TI, IR, II, OUT, H, W, C, NPX, LDX,
+def patch_corr_kernel(X, TR, TI, IR, II, OUT, H, W, C, NPX, LDN, LDH, LDX,
                       P: tl.constexpr, PPP: tl.constexpr, BLOCK_C: tl.constexpr):
     pid = tl.program_id(0)
     pid_c = tl.program_id(1)
@@ -144,7 +146,7 @@ def patch_corr_kernel(X, TR, TI, IR, II, OUT, H, W, C, NPX, LDX,
     for q in range(PPP):
         px = px0 + q
         if px < NPX:
-            off = _patch_ptrs(n, py, px, H, W, LDX, P)
+            off = _patch_ptrs(n, py, px, LDN, LDH, LDX, P)
             qv = tl.load(X + off[:, None] + cs[None, :], mask=cmask[None, :], other=0.0).to(tr.dtype)
             kv = tl.load(X + off[:, None] + C + cs[None, :], mask=cmask[None, :], other=0.0).to(tr.dtype)
             qr = tl.dot(tr, qv)
@@ -161,7 +163,10 @@ def patch_corr_kernel(X, TR, TI, IR, II, OUT, H, W, C, NPX, LDX,
 
 
 def patch_corr(x, c, mats, p=8, out=None):
+    """x [N, H, W, >= 2c] with unit channel stride (other strides arbitrary); q = x[..., :c],
+    k = x[..., c:2c] -> out [N, H, W, c] fp32 (contiguous)."""
     n, h, w, _ = x.shape
+    assert x.stride(3) == 1 and (out is None or out.is_contiguous())
     if out is None:
         out = torch.empty((n, h, w, c), device=x.device, dtype=torch.float32)
     npx = w // p
@@ -170,7 +175,7 @@ def patch_corr(x, c, mats, p=8, out=None):
     def launch(cf):
         bc, ppp = cf["BLOCK_C"], cf["PPP"]
         grid = (n * (h // p) * triton.cdiv(npx, ppp), triton.cdiv(c, bc))
-        patch_corr_kernel[grid](x, tr, ti, ir, ii, out, h, w, c, npx, x.stride(2), P=p, PPP=ppp, BLOCK_C=bc,
+        patch_corr_kernel[grid](x, tr, ti, ir, ii, out, h, w, c, npx, x.stride(0), x.stride(1), x.stride(2), P=p, PPP=ppp, BLOCK_C=bc,
                                 num_warps=cf["num_warps"])
 
     cands = [dict(BLOCK_C=bc, PPP=ppp, num_warps=nw) for bc, ppp, nw in

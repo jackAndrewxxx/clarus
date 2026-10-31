@@ -6,9 +6,10 @@ For crop t, channel d, state n along the raster sequence l:
 
 Each lane runs one channel's recurrence step by step (work-efficient, all in registers). The
 sequence is split into S segments so that enough programs run in parallel:
-  1. scan8_kernel(SUMMARY): per segment, the end state from h = 0 and the total decay
-                            exp(A * sum delta)
-  2. carry_kernel:          sequential combine over the S segments -> start state of each one
+  1. scan8_kernel(SUMMARY): per segment, the end state from h = 0 and sum(delta)
+  2. carry_kernel:          sequential combine over the S segments -> start state of each one,
+                            with the segment decay exp(A * sum delta) applied so that it does
+                            not underflow to 0 while decay * state is representable
   3. scan8_kernel:          per segment from its start state -> y
 (1 and 2 are skipped when one segment already gives enough parallelism.)
 """
@@ -30,26 +31,38 @@ def _softplus(x):
 
 
 @triton.jit
-def carry_kernel(PD, EH, H0, S, ND, BLOCK: tl.constexpr):
-    """H0[t, s] = PD[t, s-1] * H0[t, s-1] + EH[t, s-1], H0[t, 0] = 0 (rows of NS*D values)."""
+def carry_kernel(DSUM, A2, EH, H0, S, ND, D, BLOCK: tl.constexpr):
+    """H0[t, s] = 2^ld * H0[t, s-1] + EH[t, s-1], H0[t, 0] = 0 (rows of NS*D values, i = n*D + d),
+    ld = A2[d, n] * DSUM[t, s-1, d] (the segment's log2 decay).
+
+    2^ld alone flushes to 0 below the fp32 normal range (ld < -126) even when 2^ld * h is still
+    representable (a large incoming state), so it is applied as 2^max(ld, -126) * (h *
+    2^min(ld + 126, 0)): exact to fp32 rounding for ld >= -252; below that the term is
+    < |h| * 2^-252 (< 2^-124 for any finite h). For ld >= -126 the second factor is exactly 1,
+    i.e. the plain 2^ld * h + eh."""
     t = tl.program_id(0)
     i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = i < ND
     h = tl.zeros((BLOCK,), dtype=tl.float32)
     base = t.to(tl.int64) * S * ND
+    dch = i % D
+    a = tl.load(A2 + dch * 8 + i // D, mask=m, other=0.0)
+    dbase = t.to(tl.int64) * S * D
     for s in range(S):
         tl.store(H0 + base + s * ND + i, h, mask=m)
-        h = tl.load(PD + base + s * ND + i, mask=m, other=0.0) * h + tl.load(EH + base + s * ND + i, mask=m, other=0.0)
+        ld = a * tl.load(DSUM + dbase + s * D + dch, mask=m, other=0.0)
+        eh = tl.load(EH + base + s * ND + i, mask=m, other=0.0)
+        h = tl.exp2(tl.maximum(ld, -126.0)) * (h * tl.exp2(tl.minimum(ld + 126.0, 0.0))) + eh
 
 
 @triton.jit
-def scan8_kernel(U, DBL, DTW, DTB, A2, DP, H0, Y, PD, EH, L, D, SEG,
+def scan8_kernel(U, DBL, DTW, DTB, A2, DP, H0, Y, DSUM, EH, L, D, SEG,
                  NC: tl.constexpr, R: tl.constexpr, HAS_H0: tl.constexpr, SUMMARY: tl.constexpr,
                  BLOCK_D: tl.constexpr, UNROLL: tl.constexpr):
     """d_state = 8. One step per iteration; each lane owns one channel and keeps its 8 states in
     named registers (1-D tensors only: no layout conversions inside the loop; B / C / dt_raw of a
     step are scalars shared by all lanes). Parallelism: crops x channel blocks x segments.
-    SUMMARY: write the segment's total decay / end state (PD, EH) instead of y."""
+    SUMMARY: write the segment's sum(delta) / end state (DSUM, EH) instead of y."""
     pid = tl.program_id(0)
     nseg = tl.cdiv(L, SEG)
     t = pid // nseg
@@ -122,21 +135,14 @@ def scan8_kernel(U, DBL, DTW, DTB, A2, DP, H0, Y, PD, EH, L, D, SEG,
                 y += h7 * tl.load(rb + R + 8 + 7, mask=ok, other=0.0)
                 tl.store(Y + (t.to(tl.int64) * L + l) * D + ds, y.to(Y.dtype.element_ty), mask=dm & ok)
     if SUMMARY:
-        tl.store(PD + hb + 0 * D, tl.exp2(a0 * dsum), mask=dm)
+        tl.store(DSUM + pid.to(tl.int64) * D + ds, dsum, mask=dm)
         tl.store(EH + hb + 0 * D, h0, mask=dm)
-        tl.store(PD + hb + 1 * D, tl.exp2(a1 * dsum), mask=dm)
         tl.store(EH + hb + 1 * D, h1, mask=dm)
-        tl.store(PD + hb + 2 * D, tl.exp2(a2 * dsum), mask=dm)
         tl.store(EH + hb + 2 * D, h2, mask=dm)
-        tl.store(PD + hb + 3 * D, tl.exp2(a3 * dsum), mask=dm)
         tl.store(EH + hb + 3 * D, h3, mask=dm)
-        tl.store(PD + hb + 4 * D, tl.exp2(a4 * dsum), mask=dm)
         tl.store(EH + hb + 4 * D, h4, mask=dm)
-        tl.store(PD + hb + 5 * D, tl.exp2(a5 * dsum), mask=dm)
         tl.store(EH + hb + 5 * D, h5, mask=dm)
-        tl.store(PD + hb + 6 * D, tl.exp2(a6 * dsum), mask=dm)
         tl.store(EH + hb + 6 * D, h6, mask=dm)
-        tl.store(PD + hb + 7 * D, tl.exp2(a7 * dsum), mask=dm)
         tl.store(EH + hb + 7 * D, h7, mask=dm)
 
 
@@ -158,15 +164,15 @@ def selective_scan(u, dbl, dt_w, dt_b, a2, dsk, out=None, sm_count=56):
         nd = triton.cdiv(d, bd)
         seg = max(16, triton.cdiv(L, max(1, cf["PROGS"] // (t * nd))))
         nseg = triton.cdiv(L, seg)
-        h0 = pd = eh = None
+        h0 = None
         common = dict(NC=nc, R=r, BLOCK_D=bd, UNROLL=cf["UNROLL"], num_warps=nw)
         if nseg > 1:
-            pd = torch.empty((t * nseg, ns, d), device=u.device, dtype=torch.float32)
-            eh = torch.empty_like(pd)
-            scan8_kernel[(t * nseg, nd)](u, dbl, dt_w, dt_b, a2, dsk, pd, out, pd, eh, L, d, seg,
+            dsum = torch.empty((t * nseg, d), device=u.device, dtype=torch.float32)
+            eh = torch.empty((t * nseg, ns, d), device=u.device, dtype=torch.float32)
+            scan8_kernel[(t * nseg, nd)](u, dbl, dt_w, dt_b, a2, dsk, eh, out, dsum, eh, L, d, seg,
                                          HAS_H0=False, SUMMARY=True, **common)
-            h0 = torch.empty_like(pd)
-            carry_kernel[(t, triton.cdiv(ns * d, 256))](pd, eh, h0, nseg, ns * d, BLOCK=256, num_warps=4)
+            h0 = torch.empty_like(eh)
+            carry_kernel[(t, triton.cdiv(ns * d, 256))](dsum, a2, eh, h0, nseg, ns * d, d, BLOCK=256, num_warps=4)
         scan8_kernel[(t * nseg, nd)](u, dbl, dt_w, dt_b, a2, dsk, h0 if h0 is not None else out, out,
                                      out, out, L, d, seg, HAS_H0=h0 is not None, SUMMARY=False, **common)
 

@@ -59,9 +59,15 @@ class Device:
     def synchronize(self, stream=None):
         pass
 
+    def wait_stream(self, stream):
+        """Order all later work on `stream` after the work already queued on the current stream."""
+        pass
+
     # -- memory
+    # Host buffers are zero-filled: the Rust side views whole slots as `&mut [u8]`, which must
+    # be initialized memory.
     def host_buffer(self, shape, dtype=torch.uint8) -> torch.Tensor:
-        return torch.empty(shape, dtype=dtype)
+        return torch.zeros(shape, dtype=dtype)
 
     def max_memory_gib(self) -> float | None:
         return None
@@ -101,8 +107,11 @@ class CudaDevice(Device):
     def synchronize(self, stream=None):
         (stream.synchronize if stream is not None else torch.cuda.synchronize)()
 
+    def wait_stream(self, stream):
+        stream.wait_stream(torch.cuda.current_stream(self.torch_device))
+
     def host_buffer(self, shape, dtype=torch.uint8):
-        return torch.empty(shape, dtype=dtype, pin_memory=True)
+        return torch.zeros(shape, dtype=dtype, pin_memory=True)
 
     def max_memory_gib(self):
         return torch.cuda.max_memory_allocated(self.torch_device) / 2 ** 30
@@ -157,11 +166,20 @@ class AcceleratorDevice(Device):
     def synchronize(self, stream=None):
         (stream.synchronize if stream is not None else self.mod.synchronize)()
 
+    def wait_stream(self, stream):
+        cur = getattr(self.mod, "current_stream", None)
+        if stream is None:
+            return
+        if cur is not None and hasattr(stream, "wait_stream"):
+            stream.wait_stream(cur(self.torch_device))
+        else:
+            self.mod.synchronize()  # no stream-ordering API: drain the device instead
+
     def host_buffer(self, shape, dtype=torch.uint8):
         try:
-            return torch.empty(shape, dtype=dtype, pin_memory=True)
+            return torch.zeros(shape, dtype=dtype, pin_memory=True)
         except RuntimeError:
-            return torch.empty(shape, dtype=dtype)
+            return torch.zeros(shape, dtype=dtype)
 
     def max_memory_gib(self):
         fn = getattr(self.mod, "max_memory_allocated", None)

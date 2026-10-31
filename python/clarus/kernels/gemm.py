@@ -11,6 +11,13 @@ prologue (PRO):
 A addressing (A_MODE): 0 dense rows, 1 space-to-depth 2x2 (stride-2 conv)
 C addressing (C_MODE): 0 dense rows, 1 depth-to-space 2x2 (PixelShuffle)
 epilogue: +bias, SimpleGate (B has 2N columns), GELU, *scale, +residual.
+
+fp32 A with fp16 B (PRO 0, the raw fp32 residual stream): each output row's operands are
+scaled by a power of two before the fp16 conversion, so the max-abs of everything the row
+reads lands in [2^14, 2^15) (pixel_exp() precomputes one exponent per input pixel). The scale
+is exact and divided out of the fp32 accumulators, so rows keep fp16's relative precision at
+any magnitude in fp32's normal range, without overflowing fp16 (a fixed 2^-8 flushed rows
+below ~2^-16 to zero and overflowed above ~1.6e7).
 """
 from __future__ import annotations
 
@@ -19,7 +26,39 @@ import triton
 import triton.language as tl
 
 from .spatial import _gelu as gelu  # exact-erf GELU with a fast erf
-from .tuning import TUNER, cfg, p2
+from .tuning import TUNER, aliased, cfg, p2
+
+
+@triton.jit
+def pow2(e):
+    """2^e as fp32 for int32 e in [-126, 127] (exact, built from the exponent bits)."""
+    return ((e + 127) << 23).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def pixel_exp_kernel(X, OUT, P, C, LD, BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr):
+    """OUT[p] = e such that max_c |X[p, c]| * 2^e lies in [2^14, 2^15), clamped to [-126, 126]
+    (126 for all-zero rows). X rows have stride LD."""
+    rp = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
+    pm = rp < P
+    rc = tl.arange(0, BLOCK_C)
+    amax = tl.zeros((BLOCK_P,), dtype=tl.float32)
+    for c0 in range(0, C, BLOCK_C):
+        cc = c0 + rc
+        v = tl.load(X + rp.to(tl.int64)[:, None] * LD + cc[None, :], mask=pm[:, None] & (cc < C)[None, :], other=0.0)
+        amax = tl.maximum(amax, tl.max(tl.abs(v.to(tl.float32)), axis=1))
+    ex = ((amax.to(tl.int32, bitcast=True) >> 23) & 0xFF) - 127   # floor(log2(amax)); -127 for 0
+    tl.store(OUT + rp, tl.minimum(tl.maximum(14 - ex, -126), 126), mask=pm)
+
+
+def pixel_exp(x: torch.Tensor, p: int, c: int, ld: int) -> torch.Tensor:
+    """Scale exponents of the `p` pixels (rows of `c` values at stride `ld`) of an fp32 tensor.
+    A GEMM / conv output row that reads several pixels uses the min of their exponents."""
+    out = torch.empty(p, device=x.device, dtype=torch.int32)
+    bc = min(256, max(16, p2(c)))
+    bp = max(1, 2048 // bc)
+    pixel_exp_kernel[(triton.cdiv(p, bp),)](x, out, p, c, ld, BLOCK_P=bp, BLOCK_C=bc, num_warps=4)
+    return out
 
 
 @triton.jit
@@ -36,7 +75,7 @@ def small_index(rm, H, W, OH, OW, PT, PL):
 
 @triton.jit
 def fused_gemm_kernel(
-    A, B, C, BIAS, SCALE, R, S, STATS, M2, LNW, LNB,
+    A, B, C, BIAS, SCALE, R, S, STATS, M2, LNW, LNB, AEXP,
     M, N, K,
     H, W, OH, OW, PT, PL,
     a_scale, ln_eps, LDA, LDM2,
@@ -44,7 +83,11 @@ def fused_gemm_kernel(
     HAS_BIAS: tl.constexpr, GATE: tl.constexpr, ACT: tl.constexpr, HAS_SCALE: tl.constexpr,
     HAS_RES: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+    A_DYN: tl.constexpr = False,
 ):
+    """A_DYN (PRO 0, fp32 A, fp16 B): per-row power-of-two operand scale from AEXP (pixel_exp of A;
+    a_scale unused). Otherwise PRO 0 / A_MODE 1 operands are multiplied by the static a_scale,
+    divided out at the end."""
     pid = tl.program_id(0)
     num_m = tl.cdiv(M, BLOCK_M)
     num_n = tl.cdiv(N, BLOCK_N)
@@ -85,6 +128,16 @@ def fused_gemm_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     if GATE:
         acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if A_DYN:
+        if A_MODE == 1:   # the row reads 4 input pixels
+            p0 = a_row // cin
+            e_row = tl.minimum(tl.minimum(tl.load(AEXP + p0, mask=mmask, other=126),
+                                          tl.load(AEXP + p0 + 1, mask=mmask, other=126)),
+                               tl.minimum(tl.load(AEXP + p0 + W, mask=mmask, other=126),
+                                          tl.load(AEXP + p0 + W + 1, mask=mmask, other=126)))
+        else:
+            e_row = tl.load(AEXP + rm64, mask=mmask, other=126)
+        a_row_scale = pow2(e_row)[:, None]
 
     if A_MODE == 1:
         # 2x2 stride-2 conv: K = (dy, dx, cin); one contiguous cin slab per quadrant
@@ -94,7 +147,10 @@ def fused_gemm_kernel(
                 kk = k0 + rk
                 km = kk < cin
                 a = tl.load(A + a_row[:, None] + qoff + kk[None, :], mask=mmask[:, None] & km[None, :], other=0.0)
-                a = (a.to(tl.float32) * a_scale).to(B.dtype.element_ty)
+                if A_DYN:
+                    a = (a.to(tl.float32) * a_row_scale).to(B.dtype.element_ty)
+                else:
+                    a = (a.to(tl.float32) * a_scale).to(B.dtype.element_ty)
                 b = tl.load(B + (q * cin + kk)[:, None] * LDB + rn[None, :], mask=km[:, None] & nmask[None, :],
                             other=0.0)
                 acc = tl.dot(a, b, acc)
@@ -129,8 +185,10 @@ def fused_gemm_kernel(
                 sv = tl.load(S + s_row[:, None] * K + kk[None, :], mask=amask, other=0.0)
                 a = (a.to(tl.float32) * sv.to(tl.float32)).to(B.dtype.element_ty)
             if PRO == 0:
-                # raw fp32 residual-stream operands are pre-scaled by 2^-8 so they fit fp16
-                a = (a.to(tl.float32) * a_scale).to(B.dtype.element_ty)
+                if A_DYN:
+                    a = (a.to(tl.float32) * a_row_scale).to(B.dtype.element_ty)
+                else:
+                    a = (a.to(tl.float32) * a_scale).to(B.dtype.element_ty)
             else:
                 a = a.to(B.dtype.element_ty)
             bmask = kmask[:, None] & nmask[None, :]
@@ -140,8 +198,16 @@ def fused_gemm_kernel(
                 b2 = tl.load(B + kk[:, None] * LDB + N + rn[None, :], mask=bmask, other=0.0)
                 acc2 = tl.dot(a, b2, acc2)
 
-    if PRO == 0:
+    # undo the operand scale on BOTH accumulators before bias / gate
+    if A_DYN:
+        inv = pow2(-e_row)[:, None]
+        acc = acc * inv
+        if GATE:
+            acc2 = acc2 * inv
+    elif PRO == 0:
         acc = acc * (1.0 / a_scale)
+        if GATE:
+            acc2 = acc2 * (1.0 / a_scale)
     if HAS_BIAS:
         acc += tl.load(BIAS + rn, mask=nmask, other=0.0)[None, :]
         if GATE:
@@ -295,8 +361,12 @@ def fused_gemm(a, b, *, n, k, m, out, bias=None, scale=None, residual=None, smal
             and n > 64 and small is None and stats is None and m2 is None):
         return _gemm_wide(a, b, n=n, k=k, m=m, out=out, bias=bias, scale=scale, residual=residual, ln_eps=ln_eps,
                           lda=lda, pro=pro, gate=gate, act=act)
+    a_dyn = pro == 0 and a.dtype == torch.float32 and b.dtype == torch.float16
+    if a_dyn:
+        aexp = (pixel_exp(a, a.numel() // (k // 4), k // 4, k // 4) if a_mode
+                else pixel_exp(a, m, k, int(lda if lda is not None else k)))
     if pro == 0 and a.dtype == torch.float32:
-        a_scale = 1.0 / 256.0
+        a_scale = 1.0   # fp16 B: per-row dynamic scale (A_DYN); bf16 / fp32 B have fp32's range
     args = (
         a, b, out,
         bias if bias is not None else dummy,
@@ -307,6 +377,7 @@ def fused_gemm(a, b, *, n, k, m, out, bias=None, scale=None, residual=None, smal
         m2 if m2 is not None else dummy,
         lnw if lnw is not None else dummy,
         lnb if lnb is not None else dummy,
+        aexp if a_dyn else dummy,
         m, n, k,
         h, w, oh, ow, pt, pl,
         float(a_scale), float(ln_eps), int(lda if lda is not None else k),
@@ -314,16 +385,18 @@ def fused_gemm(a, b, *, n, k, m, out, bias=None, scale=None, residual=None, smal
     )
     flags = dict(PRO=pro, A_MODE=a_mode, C_MODE=c_mode, M2_ACT=m2_act,
                  HAS_BIAS=bias is not None, GATE=gate, ACT=act, HAS_SCALE=scale is not None,
-                 HAS_RES=residual is not None)
+                 HAS_RES=residual is not None, A_DYN=a_dyn)
 
     def launch(c):
         grid = (triton.cdiv(m, c["BLOCK_M"]) * triton.cdiv(n, c["BLOCK_N"]),)
         fused_gemm_kernel[grid](*args, **flags, **c)
 
-    # the two zeros keep the key layout of earlier versions, so cached tuning stays valid
-    key = (m.bit_length(), n, k, pro, a_mode, c_mode, 0, int(gate), act, 0, str(b.dtype))
+    # gemm3: A / C dtypes joined the key (a gemm2 entry tuned for fp16 A was reused for fp32 A,
+    # a different kernel variant with fp32 operand tiles in shared memory and the A_DYN scaling)
+    key = (m.bit_length(), n, k, pro, a_mode, c_mode, int(gate), act, str(a.dtype), str(b.dtype), str(out.dtype))
     cands = _candidates(m, n, k, gate, -1 if a_mode else pro, c_mode)
-    launch(TUNER.pick("gemm2", key, cands, launch))
+    launch(TUNER.pick("gemm3", key, cands, launch, device=out.device,
+                      restore=(out,) if aliased(out, residual) else ()))
     return out
 
 
@@ -350,6 +423,7 @@ def _gemm_wide(a, b, *, n, k, m, out, bias, scale, residual, ln_eps, lda, pro, g
         if c not in cands:
             cands.append(c)
     key = (m.bit_length(), n, k, pro, int(gate), act, int(bias is not None), int(scale is not None),
-           int(residual is not None), str(b.dtype))
-    launch(TUNER.pick("gemm_wide3", key, cands, launch))
+           int(residual is not None), str(a.dtype), str(b.dtype), str(out.dtype))
+    launch(TUNER.pick("gemm_wide4", key, cands, launch, device=out.device,
+                      restore=(out,) if aliased(out, residual) else ()))
     return out

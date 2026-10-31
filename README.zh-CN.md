@@ -37,7 +37,7 @@
 | EVSSM（去模糊，Mamba） | GoPro test，1111 张 720p | `test.py`（fp32，mamba_ssm CUDA 扫描，保存 PNG） | 3972 s | 473.0 s（`eval --save`） | **8.4×** | PSNR / SSIM 34.5106 / 0.9713 → 34.5103 / 0.9713；2.4% 的像素不同，差值 ≤ 4 |
 | Real-ESRGAN x4plus（×4 超分） | Urban100 LR×4，100 张，37 种尺寸 | `inference_realesrgan.py`（默认 fp16） | 20.7 s | 12.0 s（`infer --save`） | **1.7×** | 对 HR 的 PSNR 21.0561 → 21.0568；比官方 fp16 更接近 fp32 参考（5.2% vs 7.2% 的像素不同） |
 
-单次前向（batch 1）：NAFNet 720p 251.0 → 53.3 ms；Restormer 720p 1482 → 199 ms；RRDBNet 输入 256×384 时 250（官方 fp32）/ 167（官方 fp16）→ 84 ms；FFTformer 720p 2030 → 330 ms；EVSSM 720p 3149 → 407 ms。FFTformer / EVSSM 的 PSNR / SSIM 都是用 `tools/score_outputs.py` 在保存的 PNG 上算的（`clarus eval` 自己报 34.2113 / 0.9692 和 34.5103 / 0.9711，SSIM 的差来自 basicsr 在 GPU 上用 TF32 算 SSIM）。Real-ESRGAN 加速最少：它的 3×3 卷积本来就是 cuDNN fp16 的强项，clarus 的收益主要来自 NHWC 布局，以及把密集块的拼接、LeakyReLU 和上采样融合进卷积。
+单次前向（batch 1）：NAFNet 720p 251.0 → 54.3 ms；Restormer 720p 1482 → 199 ms；RRDBNet 输入 256×384 时 250（官方 fp32）/ 167（官方 fp16）→ 84 ms；FFTformer 720p 2030 → 330 ms；EVSSM 720p 3149 → 407 ms。FFTformer / EVSSM 的 PSNR / SSIM 都是用 `tools/score_outputs.py` 在保存的 PNG 上算的（`clarus eval` 自己报 34.2113 / 0.9692 和 34.5103 / 0.9711，SSIM 的差来自 basicsr 在 GPU 上用 TF32 算 SSIM）。Real-ESRGAN 加速最少：它的 3×3 卷积本来就是 cuDNN fp16 的强项，clarus 的收益主要来自 NHWC 布局，以及把密集块的拼接、LeakyReLU 和上采样融合进卷积。
 
 每一行都可以用 `clarus eval --config <配置> --report r.json` 复现（见[验证](#验证)）；运行日志不进 git。
 
@@ -272,6 +272,10 @@ y = model.forward(x)        # x: [N, 3, H, W]，float32，范围 [0, 1]，放在
 | 引擎端到端 | `python tools/check_engine.py --device N` | `PASS` |
 | 与原流程逐图对比 | `tools/reference_eval.py` + `tools/compare_reports.py` | dPSNR p99 < 0.002 dB |
 | Rust 单测 | `cd engine && cargo test --release --offline` | 全部通过 |
+| kernel / op / 模型 / 工具契约 | `python tools/test_kernel_contracts.py`、`test_ops_contracts.py`、`test_model_contracts.py`、`test_tools.py`、`worker_smoke.py --selftest` | 全部通过 |
+
+所有工具在有失败、样本缺失或多余、或者什么都没检查到（比如没配置 reference）时都返回非零退出码。
+`clarus eval` / `infer` 只要有一张图失败就退出码 1（加 `--allow-failures` 保持 0），报告照常写出。
 
 完整命令、标准和参考数字见 `.claude/skills/clarus-adapt/references/validation.md`。
 

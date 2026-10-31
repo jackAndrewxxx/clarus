@@ -2,6 +2,7 @@
 
 model config keys:
   checkpoint:  basicsr .pth (`params` / `params_ema`), e.g. NAFNet-GoPro-width64.pth
+  params_key:  state-dict key in the checkpoint (default: params, then params_ema)
   arch_from:   basicsr yml whose `network_g` describes the network (training or test yml)
   network_g:   inline network_g dict; merged over arch_from (shallow, per key)
   options:
@@ -20,9 +21,42 @@ import torch
 import torch.nn.functional as F
 
 from .. import IOSpec, RestorationModel, register_model
-from .._fold import Folder, kn, ln_fold, load_state_dict, resolve_network_g
+from .._fold import Folder, check_state_dict, kn, ln_fold, load_checkpoint, resolve_network_g
 
 TYPES = {"NAFNet": False, "NAFNetLocal": True}
+PARAMS_KEYS = ("params", "params_ema")
+
+
+def _block_shapes(p, c):
+    """NAFBlock(c) (DW_Expand = FFN_Expand = 2): {key: shape}."""
+    return {f"{p}.conv1.weight": (2 * c, c, 1, 1), f"{p}.conv1.bias": (2 * c,),
+            f"{p}.conv2.weight": (2 * c, 1, 3, 3), f"{p}.conv2.bias": (2 * c,),
+            f"{p}.conv3.weight": (c, c, 1, 1), f"{p}.conv3.bias": (c,),
+            f"{p}.sca.1.weight": (c, c, 1, 1), f"{p}.sca.1.bias": (c,),
+            f"{p}.conv4.weight": (2 * c, c, 1, 1), f"{p}.conv4.bias": (2 * c,),
+            f"{p}.conv5.weight": (c, c, 1, 1), f"{p}.conv5.bias": (c,),
+            f"{p}.norm1.weight": (c,), f"{p}.norm1.bias": (c,), f"{p}.norm2.weight": (c,), f"{p}.norm2.bias": (c,),
+            f"{p}.beta": (1, c, 1, 1), f"{p}.gamma": (1, c, 1, 1)}
+
+
+def state_dict_shapes(width, enc, mid, dec, img_channel=3):
+    """Exact {key: shape} of the upstream NAFNet(img_channel, width, mid, enc, dec) state dict."""
+    s = {"intro.weight": (width, img_channel, 3, 3), "intro.bias": (width,),
+         "ending.weight": (img_channel, width, 3, 3), "ending.bias": (img_channel,)}
+    c = width
+    for i, n in enumerate(enc):
+        for j in range(n):
+            s.update(_block_shapes(f"encoders.{i}.{j}", c))
+        s[f"downs.{i}.weight"], s[f"downs.{i}.bias"] = (2 * c, c, 2, 2), (2 * c,)
+        c *= 2
+    for j in range(mid):
+        s.update(_block_shapes(f"middle_blks.{j}", c))
+    for i, n in enumerate(dec):
+        s[f"ups.{i}.0.weight"] = (2 * c, c, 1, 1)
+        c //= 2
+        for j in range(n):
+            s.update(_block_shapes(f"decoders.{i}.{j}", c))
+    return s
 
 
 @register_model("nafnet")
@@ -37,18 +71,27 @@ class NAFNet(RestorationModel):
             raise ValueError("img_channel != 3 is not supported by the RGB8 IO path")
         if TYPES[kind] and net.get("fast_imp"):
             raise ValueError("TLC fast_imp=True is not implemented")
-        self.net_cfg = net
+        self.width = int(net.get("width", 16))                              # upstream defaults
         self.enc = [int(v) for v in net.get("enc_blk_nums", [])]
         self.dec = [int(v) for v in net.get("dec_blk_nums", [])]
         self.mid = int(net.get("middle_blk_num", 1))
-        ts = net.get("train_size", (1, 3, 256, 256))
-        self.tlc = (int(ts[-2]), int(ts[-1])) if TYPES[kind] else None
+        if len(self.dec) != len(self.enc):
+            raise ValueError(f"NAFNet: enc_blk_nums {self.enc} and dec_blk_nums {self.dec} must have the same length")
+        self.padder = 2 ** len(self.enc)
+        self.net_cfg = {"type": kind, "img_channel": 3, "width": self.width, "middle_blk_num": self.mid,
+                        "enc_blk_nums": self.enc, "dec_blk_nums": self.dec}
+        self.tlc = None
+        if TYPES[kind]:
+            ts = [int(v) for v in net.get("train_size", (1, 3, 256, 256))]
+            self.net_cfg.update(train_size=ts, fast_imp=False)
+            self.tlc = (ts[-2], ts[-1])
         self.res_fp32_level = int((cfg.get("options") or {}).get("residual_fp32_from_level", 3))
-        f = Folder(load_state_dict(cfg), device, dtype)
+        self.params_key, sd = load_checkpoint(cfg, PARAMS_KEYS)
+        check_state_dict(sd, state_dict_shapes(self.width, self.enc, self.mid, self.dec), f"{kind} network_g")
+        f = Folder(sd, device, dtype)
         self._fold(f)
         f.check_consumed()
         self.w = f.t
-        self.padder = 2 ** len(self.enc)
         self.io = IOSpec(in_channels=3, out_channels=3, scale=1, pad_multiple=self.padder)
 
     # ---------------------------------------------------------------- weights
@@ -98,10 +141,13 @@ class NAFNet(RestorationModel):
 
     def _tlc_kernel(self, level):
         """(kh, kw) of the local mean replacing AdaptiveAvgPool2d(1) at this level (global
-        without TLC): feature size at train_size * base_size // train_size, base = 1.5x."""
+        without TLC). Upstream (Local_Base.convert) fixes it in a forward on train_size, which is
+        first zero-padded to the multiple `padder`: kernel = feature size of the padded train
+        image at this level * base_size // train_size, base_size = int(1.5 * train_size)."""
         if self.tlc is None:
             return (1 << 30, 1 << 30)
-        return tuple((t >> level) * int(t * 1.5) // t for t in self.tlc)
+        return tuple(((t + self.padder - 1) // self.padder * self.padder >> level) * int(t * 1.5) // t
+                     for t in self.tlc)
 
     def _nafblock(self, x, p, level):
         o, w = self.ops, self.w
@@ -141,4 +187,5 @@ class NAFNet(RestorationModel):
     def describe(self):
         d = super().describe()
         d["network_g"] = self.net_cfg
+        d["params_key"] = self.params_key
         return d

@@ -24,15 +24,75 @@ def resolve_network_g(cfg: dict, base_dir: str = "") -> dict:
     return net
 
 
-def load_state_dict(cfg: dict) -> dict:
-    """model.checkpoint (relative to the config dir) -> fp32 state dict ('params' / 'params_ema' / plain)."""
+def select_state_dict(raw, params_key=None, default_keys=("params", "params_ema")) -> tuple[str | None, dict]:
+    """Pick the state dict out of a loaded checkpoint -> (key used or None, state dict).
+
+    An explicit `params_key` must exist. Otherwise a dict holding tensors directly is the state
+    dict itself (key None), else the first of `default_keys` present is used. A leading
+    "module." (DataParallel) is stripped when every key has it."""
+    if not isinstance(raw, dict):
+        raise TypeError(f"checkpoint is a {type(raw).__name__}, expected a dict")
+    if params_key is not None:
+        if params_key not in raw:
+            raise KeyError(f"params_key {params_key!r} not in checkpoint; top-level keys: {sorted(raw)[:8]}")
+        key = params_key
+    elif any(torch.is_tensor(v) for v in raw.values()):
+        key = None
+    else:
+        key = next((k for k in default_keys if k in raw), None)
+        if key is None:
+            raise KeyError(f"checkpoint has none of {list(default_keys)} and no tensors at the top level; "
+                           f"top-level keys: {sorted(raw)[:8]} (set model.params_key)")
+    sd = raw if key is None else raw[key]
+    if not isinstance(sd, dict):
+        raise TypeError(f"checkpoint[{key!r}] is a {type(sd).__name__}, expected a state dict")
+    if sd and all(k.startswith("module.") for k in sd):
+        sd = {k[len("module."):]: v for k, v in sd.items()}
+    return key, sd
+
+
+def load_checkpoint(cfg: dict, params_keys=("params", "params_ema")) -> tuple[str | None, dict]:
+    """model.checkpoint (relative to the config dir) -> (params key used, fp32 state dict); the
+    key is chosen by select_state_dict(raw, model.params_key, params_keys)."""
     ckpt = cfg["checkpoint"]
     if not os.path.isabs(ckpt):
         ckpt = os.path.join(cfg.get("_config_dir", ""), ckpt)
-    sd = torch.load(ckpt, map_location="cpu", weights_only=True)
-    key = cfg.get("params_key") or ("params" if "params" in sd else "params_ema" if "params_ema" in sd else None)
-    sd = sd[key] if key else sd
-    return {k.removeprefix("module."): v.float() for k, v in sd.items()}
+    raw = torch.load(ckpt, map_location="cpu", weights_only=True)
+    key, sd = select_state_dict(raw, cfg.get("params_key"), params_keys)
+    return key, {k: v.float() for k, v in sd.items()}
+
+
+def load_state_dict(cfg: dict, params_keys=("params", "params_ema")) -> dict:
+    """model.checkpoint -> fp32 state dict (see load_checkpoint)."""
+    return load_checkpoint(cfg, params_keys)[1]
+
+
+def check_state_dict(sd: dict, expected: dict, what: str = "network_g") -> None:
+    """Exact contract check: `sd` must have exactly the keys of `expected` ({key: shape}) with
+    those shapes; ValueError listing a few missing / unexpected / mis-shaped tensors otherwise."""
+    missing = [k for k in expected if k not in sd]
+    unexpected = [k for k in sd if k not in expected]
+    shapes = [f"{k}: checkpoint {tuple(sd[k].shape)} vs expected {tuple(expected[k])}"
+              for k in expected if k in sd and tuple(sd[k].shape) != tuple(expected[k])]
+    if missing or unexpected or shapes:
+        parts = []
+        if missing:
+            parts.append(f"{len(missing)} missing (e.g. {missing[:4]})")
+        if unexpected:
+            parts.append(f"{len(unexpected)} unexpected (e.g. {unexpected[:4]})")
+        if shapes:
+            parts.append(f"{len(shapes)} with wrong shape (e.g. {shapes[:3]})")
+        raise ValueError(f"checkpoint does not match the configured {what}: " + "; ".join(parts))
+
+
+def check_reflect_pad(h: int, w: int, multiple: int, model: str) -> None:
+    """Official test code reflect-pads H, W up to `multiple`; PyTorch rejects a reflect pad >= the
+    input size, so tiny inputs fail upstream too. Raise a clear error naming the minimum size."""
+    for n in (h, w):
+        pad = (-n) % multiple
+        if pad and pad >= n:
+            raise ValueError(f"{model}: input {h}x{w} is too small: it is reflect-padded to a multiple of "
+                             f"{multiple} like the official code, which needs H and W >= {multiple // 2 + 1}")
 
 
 class Folder:

@@ -1,6 +1,7 @@
 """Dense 3x3 convolutions (stride 1, pad 1) for NHWC activations.
 
-conv3x3():  implicit GEMM, fp32 inputs pre-scaled by 2^-8 into fp16, weights padded to a
+conv3x3():  implicit GEMM; fp32 inputs with fp16 weights get a per-output-row power-of-two
+            scale (gemm.pixel_exp, min over the 3x3 window) before the fp16 conversion, weights padded to a
             multiple of 16 output channels, and an NCHW fp32 output mode with fused
             `+ inp` residual (the network's final `ending` conv).
 intro3x3(): 3 -> C conv reading the NCHW fp32 image directly (27 FMAs / output).
@@ -11,11 +12,12 @@ import torch
 import triton
 import triton.language as tl
 
-from .tuning import TUNER, cfg, p2
+from .gemm import pixel_exp, pow2
+from .tuning import TUNER, aliased, cfg, p2
 
 
 @triton.jit
-def conv3x3_kernel(X1, Wk, BIAS, RES, OUT, M, H, W, C1, COUT, LDW, a_scale, out_scale, slope,
+def conv3x3_kernel(X1, Wk, BIAS, RES, OUT, AEXP, M, H, W, C1, COUT, LDW, out_scale, slope,
                    LDX1, LDO, LDR,
                    HAS_RES: tl.constexpr, OUT_NCHW: tl.constexpr, A_FP32: tl.constexpr,
                    ACT: tl.constexpr, UP2: tl.constexpr,
@@ -46,6 +48,18 @@ def conv3x3_kernel(X1, Wk, BIAS, RES, OUT, M, H, W, C1, COUT, LDW, a_scale, out_
         WS = W
     rk = tl.arange(0, BLOCK_K)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if A_FP32:   # raw fp32 operands: per-row power-of-two scale (max-abs over the 3x3 window)
+        e_row = tl.full((BLOCK_M,), 126, tl.int32)
+        for tap in tl.static_range(9):
+            ey = y + (tap // 3) - 1
+            ex = x + (tap % 3) - 1
+            ev = mmask & (ey >= 0) & (ey < H) & (ex >= 0) & (ex < W)
+            if UP2:
+                ey = ey // 2
+                ex = ex // 2
+            e_row = tl.minimum(e_row, tl.load(AEXP + img.to(tl.int64) * (HS * WS) + ey * WS + ex,
+                                              mask=ev, other=126))
+        a_row_scale = pow2(e_row)[:, None]
     # one flat loop over (tap, K chunk) so the software pipeliner (num_stages) overlaps the loads
     # of the next chunk with the current MMA even when C1 fits in a single chunk
     nk = tl.cdiv(C1, BLOCK_K)
@@ -61,15 +75,15 @@ def conv3x3_kernel(X1, Wk, BIAS, RES, OUT, M, H, W, C1, COUT, LDW, a_scale, out_
         pix = img.to(tl.int64) * (HS * WS) + yy * WS + xx
         kk = k0 + rk
         a = tl.load(X1 + pix[:, None] * LDX1 + kk[None, :], mask=valid[:, None] & (kk < C1)[None, :], other=0.0)
-        if A_FP32:   # raw fp32 residual-stream operands are pre-scaled by 2^-8 to fit fp16
-            a = (a * a_scale).to(Wk.dtype.element_ty)
+        if A_FP32:
+            a = (a * a_row_scale).to(Wk.dtype.element_ty)
         else:
             a = a.to(Wk.dtype.element_ty)
         b = tl.load(Wk + (t * C1 + kk)[:, None] * LDW + rn[None, :],
                     mask=(kk < C1)[:, None] & wmask[None, :], other=0.0)
         acc = tl.dot(a, b, acc)
     if A_FP32:
-        acc = acc * (1.0 / a_scale)
+        acc = acc * pow2(-e_row)[:, None]
     acc += tl.load(BIAS + rn, mask=nmask, other=0.0)[None, :]
     if ACT == 1:
         acc = tl.where(acc >= 0, acc, acc * slope)
@@ -121,17 +135,17 @@ def conv3x3(x1, wk, bias, cout, residual=None, out=None, out_dtype=None, nchw_ou
     if out is None:
         shape = (n, cout, h, w) if nchw_out else (n, h, w, cout)
         out = torch.empty(shape, device=x1.device, dtype=out_dtype or x1.dtype)
-    a_scale = 1.0 / 256.0 if x1.dtype == torch.float32 else 1.0
     flags = dict(HAS_RES=residual is not None, OUT_NCHW=nchw_out, ACT=int(act), UP2=bool(up2),
-                 A_FP32=x1.dtype == torch.float32)
+                 A_FP32=x1.dtype == torch.float32 and wk.dtype == torch.float16)
     ldx1 = _pix_stride(x1)
     ldo = 0 if nchw_out else _pix_stride(out)
     ldr = _pix_stride(residual) if (residual is not None and not nchw_out) else 0
+    aexp = pixel_exp(x1, x1.shape[0] * x1.shape[1] * x1.shape[2], c1, ldx1) if flags["A_FP32"] else out
 
     def launch(c):
         grid = (triton.cdiv(m, c["BLOCK_M"]), triton.cdiv(cout, c["BLOCK_N"]))
-        conv3x3_kernel[grid](x1, wk, bias, residual if residual is not None else out, out,
-                             m, h, w, c1, cout, ldw, a_scale, float(out_scale), float(slope), ldx1, ldo, ldr,
+        conv3x3_kernel[grid](x1, wk, bias, residual if residual is not None else out, out, aexp,
+                             m, h, w, c1, cout, ldw, float(out_scale), float(slope), ldx1, ldo, ldr,
                              **flags, **c)
 
     cands = []
@@ -147,7 +161,10 @@ def conv3x3(x1, wk, bias, cout, residual=None, out=None, out_dtype=None, nchw_ou
             cands.append(c)
     key = (m.bit_length(), c1, 0, cout, ldw, int(residual is not None), int(nchw_out),
            str(x1.dtype), str(wk.dtype), str(out.dtype)) + ((int(act), int(up2)) if (act or up2) else ())
-    launch(TUNER.pick("conv3x3g", key, cands, launch))
+    # out == residual (in-place residual add) is valid for one launch, but the tuner's repeated
+    # launches would accumulate into it: snapshot / restore it around benchmarking
+    launch(TUNER.pick("conv3x3g", key, cands, launch, device=out.device,
+                      restore=(out,) if aliased(out, residual) else ()))
     return out
 
 

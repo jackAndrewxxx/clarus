@@ -104,19 +104,19 @@ class TorchOps(Backend):
                residual=None, mul=None, out_dtype=None, ln_eps=1e-6):
         """1x1 conv as GEMM, w [K, N] (2N columns when gate=True).
 
-        out = epilogue(prologue(x) @ w): prologue = LayerNorm (ln=True; ln="rms": x / rms(x),
-        no mean subtraction) or * expand(mul);
-        epilogue = +bias, SimpleGate, GELU, *scale, +residual. x may be a `Small` (applied to
-        the local-mean map).
+        out = epilogue(prologue(x) @ w): prologue = * expand(mul), then LayerNorm (ln=True;
+        ln="rms": x / rms(x), no mean subtraction); epilogue = +bias, SimpleGate, GELU, *scale,
+        +residual. The GEMM and epilogue run in fp32 (fp32 operands), cast to out_dtype at the
+        end. x may be a `Small` (applied to the local-mean map).
         """
         if isinstance(x, Small):
-            return x.with_data(self.linear(x.data, w, bias, ln, act, gate, scale, residual))
+            return x.with_data(self.linear(x.data, w, bias, ln, act, gate, scale, residual, mul, out_dtype, ln_eps))
         a = x.float()
         if mul is not None:
             a = a * self.expand(mul).float()
         if ln:
             a = self._ln(a, ln_eps, rms=ln == "rms")
-        out = torch.matmul(a.to(w.dtype), w).float()
+        out = torch.matmul(a, w.float())
         if bias is not None:
             out = out + bias
         if gate:
@@ -271,8 +271,9 @@ class TorchOps(Backend):
 
     def linear_patch_filter(self, x, w, bias, f, ln=False, ln_eps=1e-6, residual=None):
         """patch_filter(linear(x, w, bias, ln), f, residual) (FFTformer DFFN project_in + filter,
-        EVSSM EDFFN project_out + filter)."""
-        return self.patch_filter(self.linear(x, w, bias, ln=ln, ln_eps=ln_eps), f, residual=residual)
+        EVSSM EDFFN project_out + filter). The intermediate stays fp32, like the fused kernel's."""
+        y = self.linear(x, w, bias, ln=ln, ln_eps=ln_eps, out_dtype=torch.float32)
+        return self.patch_filter(y, f, residual=residual)
 
     def patch_corr(self, x, c, p=8):
         """FFTformer FSAS: per p x p patch, irfft2(rfft2(q) * rfft2(k)) with q = x[..., :c],
@@ -293,7 +294,7 @@ class TorchOps(Backend):
         a = self._ln(x, ln_eps) * ln_w + ln_b
         mm = m.float()
         a = a * (F.gelu(mm) if m_act == "gelu" else mm)
-        out = torch.matmul(a.to(w.dtype), w).float()
+        out = torch.matmul(a, w.float())
         if bias is not None:
             out = out + bias
         if residual is not None:

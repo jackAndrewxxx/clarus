@@ -2,6 +2,7 @@
 
 model config keys:
   checkpoint:  .pth with `params_ema` / `params` (e.g. RealESRGAN_x4plus.pth)
+  params_key:  state-dict key in the checkpoint (default: params_ema, then params)
   network_g:   {type: RRDBNet, num_in_ch: 3, num_out_ch: 3, scale: 4, num_feat: 64,
                 num_block: 23, num_grow_ch: 32}
 
@@ -13,14 +14,31 @@ nearest x2 upsampling is fused into the following conv's input addressing.
 """
 from __future__ import annotations
 
-import os
-
 import torch
+import torch.nn.functional as F
 
 from .. import IOSpec, RestorationModel, register_model
-from .._fold import resolve_network_g
+from .._fold import check_reflect_pad, check_state_dict, load_checkpoint, resolve_network_g
 
 DEFAULTS = dict(num_in_ch=3, num_out_ch=3, scale=4, num_feat=64, num_block=23, num_grow_ch=32)
+PARAMS_KEYS = ("params_ema", "params")
+
+
+def state_dict_shapes(num_in_ch, num_out_ch, scale, num_feat, num_block, num_grow_ch):
+    """Exact {key: shape} of the basicsr RRDBNet state dict (every conv is 3x3 with bias)."""
+    nf, g = num_feat, num_grow_ch
+    cin = num_in_ch * {4: 1, 2: 4, 1: 16}[scale]
+
+    def conv(name, co, ci):
+        return {f"{name}.weight": (co, ci, 3, 3), f"{name}.bias": (co,)}
+
+    s = {**conv("conv_first", nf, cin), **conv("conv_body", nf, nf), **conv("conv_up1", nf, nf),
+         **conv("conv_up2", nf, nf), **conv("conv_hr", nf, nf), **conv("conv_last", num_out_ch, nf)}
+    for i in range(num_block):
+        for j in (1, 2, 3):
+            for c in range(1, 6):
+                s.update(conv(f"body.{i}.rdb{j}.conv{c}", nf if c == 5 else g, nf + (c - 1) * g))
+    return s
 
 
 @register_model("rrdbnet", "realesrgan", "esrgan")
@@ -36,30 +54,15 @@ class RRDBNet(RestorationModel):
         if net["scale"] not in (1, 2, 4):
             raise ValueError("RRDBNet scale must be 1, 2 or 4")
         self.net_cfg = net
-        ckpt = cfg["checkpoint"]
-        if not os.path.isabs(ckpt):
-            ckpt = os.path.join(cfg.get("_config_dir", ""), ckpt)
-        sd = torch.load(ckpt, map_location="cpu", weights_only=True)
-        key = cfg.get("params_key") or ("params_ema" if "params_ema" in sd else "params" if "params" in sd else None)
-        sd = sd[key] if key else sd
-        self.w = self._load(sd, net)
+        self.params_key, sd = load_checkpoint(cfg, PARAMS_KEYS)
+        check_state_dict(sd, state_dict_shapes(*(net[k] for k in DEFAULTS)), "RRDBNet network_g")
+        self.w = {k: v.to(self.device, torch.float32 if k.endswith(".bias") else self.dtype).contiguous()
+                  for k, v in sd.items()}
+        # scale 2 / 1 pixel-unshuffle the input by 2 / 4: reflect-padded to that multiple here and
+        # the output cropped, as RealESRGANer.pre_process / post_process do (pad_multiple stays 1:
+        # the worker would zero-pad to it)
+        self.mod = {4: 1, 2: 2, 1: 4}[net["scale"]]
         self.io = IOSpec(in_channels=3, out_channels=3, scale=net["scale"], pad_multiple=1)
-
-    def _load(self, sd, net):
-        used = set()
-        w = {}
-        for k, v in sd.items():
-            used.add(k)
-            keep = k.endswith(".bias")
-            w[k] = v.float().to(self.device, torch.float32 if keep else self.dtype).contiguous()
-        need = ["conv_first.weight", "conv_body.weight", "conv_up1.weight", "conv_up2.weight", "conv_hr.weight",
-                "conv_last.weight"] + [f"body.{i}.rdb{j}.conv{c}.weight" for i in range(net["num_block"])
-                                       for j in (1, 2, 3) for c in range(1, 6)]
-        missing = [k for k in need if k not in w]
-        extra = [k for k in w if not any(k.startswith(p.rsplit(".", 1)[0]) for p in need)]
-        if missing or extra:
-            raise ValueError(f"checkpoint does not match network_g: missing {missing[:4]}, unexpected {extra[:4]}")
-        return w
 
     def _conv(self, x, name, **kw):
         return self.ops.conv3x3(x, self.w[f"{name}.weight"], self.w[f"{name}.bias"], **kw)
@@ -69,6 +72,10 @@ class RRDBNet(RestorationModel):
         o, net = self.ops, self.net_cfg
         nf, g = net["num_feat"], net["num_grow_ch"]
         n, _, h, wd = inp.shape
+        ph, pw = (-h) % self.mod, (-wd) % self.mod
+        if ph or pw:
+            check_reflect_pad(h, wd, self.mod, "RRDBNet")
+            inp = F.pad(inp, (0, pw, 0, ph), mode="reflect")
         x = inp.permute(0, 2, 3, 1).to(self.dtype).contiguous()
         if net["scale"] == 2:
             x = o.pixel_unshuffle(x)
@@ -97,10 +104,14 @@ class RRDBNet(RestorationModel):
         f = self._conv(body, "conv_up1", act="lrelu", up2=True)
         f = self._conv(f, "conv_up2", act="lrelu", up2=True)
         f = self._conv(f, "conv_hr", act="lrelu")
-        out = self._conv(f, "conv_last", out_dtype=torch.float32)
-        return out.permute(0, 3, 1, 2)
+        out = self._conv(f, "conv_last", out_dtype=torch.float32).permute(0, 3, 1, 2)
+        if ph or pw:
+            s = net["scale"]
+            out = out[:, :, :h * s, :wd * s]
+        return out
 
     def describe(self):
         d = super().describe()
         d["network_g"] = self.net_cfg
+        d["params_key"] = self.params_key
         return d

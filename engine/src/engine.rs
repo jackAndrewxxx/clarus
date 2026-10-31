@@ -162,6 +162,14 @@ impl<'a> State<'a> {
                 self.decoding -= 1;
                 let r = &mut self.results[req];
                 (r.decode_ms, r.h, r.w) = (ms, h, w);
+                let scanned = self.reqs[req].shape;
+                // batches are planned / admitted on the scanned shape: a file that changed
+                // since the scan must not run at the old size
+                let err = err.or_else(|| {
+                    ((h, w) != scanned).then(|| format!(
+                        "{}: decoded size {h}x{w} (HxW) differs from scanned {}x{} (file changed during the run?)",
+                        self.reqs[req].lq.display(), scanned.0, scanned.1))
+                });
                 if let Some(e) = err {
                     eprintln!("[clarus] decode failed: {e}");
                     r.error = Some(e);
@@ -310,92 +318,109 @@ fn parse(s: &str, what: &str) -> Result<Value, String> {
     serde_json::from_str(s).map_err(|e| format!("bad JSON from worker.{what}: {e}: {s}"))
 }
 
+impl<'a> State<'a> {
+    fn new(reqs: &'a [Request], cfg: &'a Config, mem: SlotMem) -> State<'a> {
+        let n = reqs.len();
+        let (tx, rx) = channel::<Done>();
+        let plan = if cfg.batching == Batching::Static { make_plan(reqs, cfg) } else { Vec::new() };
+        let order: Vec<usize> = if cfg.batching == Batching::Static {
+            plan.iter().flat_map(|(ids, _)| ids.iter().copied()).collect()
+        } else {
+            (0..n).filter(|&i| reqs[i].reject.is_none()).collect()
+        };
+        let mut results: Vec<ImageResult> = reqs
+            .iter()
+            .map(|r| ImageResult { name: r.name.clone(), h: r.shape.0, w: r.shape.1, ..Default::default() })
+            .collect();
+        let mut pre_done = 0;
+        for (i, r) in reqs.iter().enumerate() {
+            if let Some(e) = &r.reject {
+                results[i].error = Some(e.clone());
+                pre_done += 1;
+            }
+        }
+        State {
+            reqs,
+            cfg,
+            scale: mem.scale,
+            pool: IoPool::new(cfg.io_threads, mem, tx),
+            rx,
+            results,
+            free: (0..cfg.slots).rev().collect(),
+            order,
+            next_decode: 0,
+            slot_of: vec![None; n],
+            failed: vec![false; n],
+            ready: BTreeMap::new(),
+            plan,
+            next_plan: 0,
+            inflight: HashMap::new(),
+            decoding: 0,
+            encoding: 0,
+            done: pre_done,
+            next_batch: 0,
+            stats: RunStats::default(),
+            batch_ms_sum: 0.0,
+            batch_items: 0,
+            enc_ms_sum: 0.0,
+            enc_n: 0,
+            t0: Instant::now(),
+        }
+    }
+
+    /// Scheduler loop until every request is finished; returns the time spent blocked (s).
+    fn drive(&mut self, worker: &PyHandle) -> Result<f64, String> {
+        let n = self.reqs.len();
+        let mut blocked = 0.0f64;
+        while self.done < n {
+            let mut progressed = self.feed_decoders();
+            while let Ok(ev) = self.rx.try_recv() {
+                self.on_io(ev);
+                progressed = true;
+            }
+            progressed |= self.dispatch(worker)?;
+            if !self.inflight.is_empty() {
+                let v = parse(&worker.call("poll", "")?, "poll")?;
+                for b in v.as_array().into_iter().flatten() {
+                    self.on_batch(b)?;
+                    progressed = true;
+                }
+            }
+            if self.done >= n || progressed {
+                continue;
+            }
+            // nothing to do right now: block on the oldest device batch, else on IO
+            let tb = Instant::now();
+            if !self.inflight.is_empty() {
+                let v = parse(&worker.call("wait", "")?, "wait")?;
+                if !v.is_null() {
+                    self.on_batch(&v)?;
+                }
+            } else if self.decoding > 0 || self.encoding > 0 {
+                match self.rx.recv() {
+                    Ok(ev) => self.on_io(ev),
+                    Err(_) => return Err("IO pool terminated unexpectedly".into()),
+                }
+            } else {
+                return Err(format!("scheduler stalled with {}/{n} requests finished (slots {} < batch size?)",
+                                   self.done, self.cfg.slots));
+            }
+            blocked += ms(tb) / 1e3;
+        }
+        Ok(blocked)
+    }
+}
+
 pub fn run(worker: &PyHandle, mem: SlotMem, reqs: &[Request], cfg: &Config)
            -> Result<(Vec<ImageResult>, RunStats), String> {
     let n = reqs.len();
-    let (tx, rx) = channel::<Done>();
-    let plan = if cfg.batching == Batching::Static { make_plan(reqs, cfg) } else { Vec::new() };
-    let order: Vec<usize> = if cfg.batching == Batching::Static {
-        plan.iter().flat_map(|(ids, _)| ids.iter().copied()).collect()
-    } else {
-        (0..n).filter(|&i| reqs[i].reject.is_none()).collect()
-    };
-    let mut results: Vec<ImageResult> = reqs
-        .iter()
-        .map(|r| ImageResult { name: r.name.clone(), h: r.shape.0, w: r.shape.1, ..Default::default() })
-        .collect();
-    let mut pre_done = 0;
-    for (i, r) in reqs.iter().enumerate() {
-        if let Some(e) = &r.reject {
-            results[i].error = Some(e.clone());
-            pre_done += 1;
-        }
-    }
-    let mut st = State {
-        reqs,
-        cfg,
-        scale: mem.scale,
-        pool: IoPool::new(cfg.io_threads, mem, tx),
-        rx,
-        results,
-        free: (0..cfg.slots).rev().collect(),
-        order,
-        next_decode: 0,
-        slot_of: vec![None; n],
-        failed: vec![false; n],
-        ready: BTreeMap::new(),
-        plan,
-        next_plan: 0,
-        inflight: HashMap::new(),
-        decoding: 0,
-        encoding: 0,
-        done: pre_done,
-        next_batch: 0,
-        stats: RunStats::default(),
-        batch_ms_sum: 0.0,
-        batch_items: 0,
-        enc_ms_sum: 0.0,
-        enc_n: 0,
-        t0: Instant::now(),
-    };
-    let mut blocked = 0.0f64;
-    while st.done < n {
-        let mut progressed = st.feed_decoders();
-        while let Ok(ev) = st.rx.try_recv() {
-            st.on_io(ev);
-            progressed = true;
-        }
-        progressed |= st.dispatch(worker)?;
-        if !st.inflight.is_empty() {
-            let v = parse(&worker.call("poll", "")?, "poll")?;
-            for b in v.as_array().into_iter().flatten() {
-                st.on_batch(b)?;
-                progressed = true;
-            }
-        }
-        if st.done >= n || progressed {
-            continue;
-        }
-        // nothing to do right now: block on the oldest device batch, else on IO
-        let tb = Instant::now();
-        if !st.inflight.is_empty() {
-            let v = parse(&worker.call("wait", "")?, "wait")?;
-            if !v.is_null() {
-                st.on_batch(&v)?;
-            }
-        } else if st.decoding > 0 || st.encoding > 0 {
-            match st.rx.recv() {
-                Ok(ev) => st.on_io(ev),
-                Err(_) => return Err("IO pool terminated unexpectedly".into()),
-            }
-        } else {
-            return Err(format!("scheduler stalled with {}/{n} requests finished (slots {} < batch size?)",
-                               st.done, cfg.slots));
-        }
-        blocked += ms(tb) / 1e3;
-    }
+    let mut st = State::new(reqs, cfg, mem);
+    let r = st.drive(worker);
     let State { pool, results, mut stats, batch_ms_sum, batch_items, enc_ms_sum, enc_n, t0, .. } = st;
+    // success or error: no new work is dispatched now; wait for every IO job still touching
+    // slot memory before returning (the caller then shuts the worker down)
     pool.shutdown();
+    let blocked = r?;
     stats.wall_s = t0.elapsed().as_secs_f64();
     stats.images = n;
     stats.failed = results.iter().filter(|r| r.error.is_some()).count();
@@ -437,5 +462,49 @@ mod tests {
         let reqs = vec![req(0, a), req(1, b), req(2, a), req(3, a), req(4, b)];
         let plan = make_plan(&reqs, &cfg(&[1, 2]));
         assert_eq!(plan, vec![(vec![0, 2], 2), (vec![1, 4], 2), (vec![3], 1)]);
+    }
+
+    /// An input whose decoded size differs from the scanned one fails (and frees its slot)
+    /// instead of being batched at the scanned shape.
+    #[test]
+    fn decoded_shape_mismatch_fails_request() {
+        let dir = std::env::temp_dir().join(format!("clarus_engine_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (h, w) = (4, 6);
+        let png = crate::png::encode_rgb8(&vec![7u8; h * w * 3], w, h, 1).unwrap();
+        let path = dir.join("a.png");
+        std::fs::write(&path, png).unwrap();
+        let stride = 3 * 256;
+        let mut buf = vec![0u8; 8 * stride];
+        let mem = SlotMem { base: buf.as_mut_ptr() as usize, slot_stride: stride,
+                            planes: [(0, 256), (256, 256), (512, 256)], scale: 1 };
+        for batching in [Batching::Static, Batching::Dynamic] {
+            let mut c = cfg(&[1, 2]);
+            c.batching = batching;
+            // request 0 was scanned at the wrong size (file replaced), request 1 matches
+            let reqs: Vec<Request> = [(h + 1, w), (h, w)]
+                .iter()
+                .enumerate()
+                .map(|(i, &shape)| Request { lq: path.clone(), ..req(i, shape) })
+                .collect();
+            let mut st = State::new(&reqs, &c, mem);
+            assert!(st.feed_decoders());
+            for _ in 0..2 {
+                let ev = st.rx.recv().unwrap();
+                st.on_io(ev);
+            }
+            assert!(st.failed[0] && !st.failed[1]);
+            let e = st.results[0].error.as_deref().unwrap();
+            assert!(e.contains("differs from scanned 5x6"), "{e}");
+            assert_eq!(st.done, 1);
+            assert_eq!(st.free.len(), c.slots - 1);
+            assert!(st.slot_of[0].is_none() && st.slot_of[1].is_some());
+            if batching == Batching::Dynamic {
+                let queued: Vec<usize> = st.ready.values().flatten().map(|x| x.0).collect();
+                assert_eq!(queued, vec![1]);
+            }
+        }
+        drop(buf);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

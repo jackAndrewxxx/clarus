@@ -2,6 +2,7 @@
 
 model config keys:
   checkpoint:  official .pth (`params`)
+  params_key:  state-dict key in the checkpoint (default: params, then params_ema)
   network_g:   the official `network_g` (dim, num_blocks, num_refinement_blocks, heads,
                ffn_expansion_factor, bias, LayerNorm_type); or `arch_from: Options/<task>.yml`
   options:
@@ -11,20 +12,61 @@ model config keys:
 Inference layout: NHWC activations; LayerNorm affine folded into the following 1x1 conv
 (qkv, project_in); MDTA attention is evaluated as a per-image channel-mixing matrix that is
 multiplied into project_out, so attention costs one Gram reduction and one GEMM per block.
+The input is reflect-padded to a multiple of 8 like the official test script (needs H, W >= 5).
 """
 from __future__ import annotations
-
-import os
 
 import torch
 import torch.nn.functional as F
 
 from .. import IOSpec, RestorationModel, register_model
-from .._fold import resolve_network_g
+from .._fold import check_reflect_pad, check_state_dict, load_checkpoint, resolve_network_g
 
 DEFAULTS = dict(inp_channels=3, out_channels=3, dim=48, num_blocks=[4, 6, 6, 8], num_refinement_blocks=4,
                 heads=[1, 2, 4, 8], ffn_expansion_factor=2.66, bias=False, LayerNorm_type="WithBias",
                 dual_pixel_task=False)
+PARAMS_KEYS = ("params", "params_ema")
+
+
+def _conv(s, name, co, ci, k, bias):
+    s[f"{name}.weight"] = (co, ci, k, k)
+    if bias:
+        s[f"{name}.bias"] = (co,)
+
+
+def state_dict_shapes(net):
+    """Exact {key: shape} of the upstream Restormer state dict (WithBias LayerNorm, RGB, no dual pixel)."""
+    d, nb, hd, b, ffn = net["dim"], net["num_blocks"], net["heads"], net["bias"], net["ffn_expansion_factor"]
+    s = {}
+
+    def block(p, c, heads):
+        hid = int(c * ffn)
+        for n in ("norm1", "norm2"):
+            s[f"{p}.{n}.body.weight"] = s[f"{p}.{n}.body.bias"] = (c,)
+        s[f"{p}.attn.temperature"] = (heads, 1, 1)
+        _conv(s, f"{p}.attn.qkv", 3 * c, c, 1, b)
+        _conv(s, f"{p}.attn.qkv_dwconv", 3 * c, 1, 3, b)
+        _conv(s, f"{p}.attn.project_out", c, c, 1, b)
+        _conv(s, f"{p}.ffn.project_in", 2 * hid, c, 1, b)
+        _conv(s, f"{p}.ffn.dwconv", 2 * hid, 1, 3, b)
+        _conv(s, f"{p}.ffn.project_out", c, hid, 1, b)
+
+    _conv(s, "patch_embed.proj", d, 3, 3, False)
+    for name, n, c, h in (("encoder_level1", nb[0], d, hd[0]), ("encoder_level2", nb[1], 2 * d, hd[1]),
+                          ("encoder_level3", nb[2], 4 * d, hd[2]), ("latent", nb[3], 8 * d, hd[3]),
+                          ("decoder_level3", nb[2], 4 * d, hd[2]), ("decoder_level2", nb[1], 2 * d, hd[1]),
+                          ("decoder_level1", nb[0], 2 * d, hd[0]),
+                          ("refinement", net["num_refinement_blocks"], 2 * d, hd[0])):
+        for i in range(n):
+            block(f"{name}.{i}", c, h)
+    for name, c in (("down1_2", d), ("down2_3", 2 * d), ("down3_4", 4 * d)):
+        _conv(s, f"{name}.body.0", c // 2, c, 3, False)                     # then PixelUnshuffle(2)
+    for name, c in (("up4_3", 8 * d), ("up3_2", 4 * d), ("up2_1", 2 * d)):
+        _conv(s, f"{name}.body.0", 2 * c, c, 3, False)                      # then PixelShuffle(2)
+    _conv(s, "reduce_chan_level3", 4 * d, 8 * d, 1, b)
+    _conv(s, "reduce_chan_level2", 2 * d, 4 * d, 1, b)
+    _conv(s, "output", 3, 2 * d, 3, b)
+    return s
 
 
 def _kn(w):
@@ -45,12 +87,8 @@ class Restormer(RestorationModel):
         if net["dual_pixel_task"] or net["inp_channels"] != 3 or net["out_channels"] != 3:
             raise ValueError("Restormer dual-pixel / non-RGB variants are not implemented")
         self.net_cfg = net
-        ckpt = cfg["checkpoint"]
-        if not os.path.isabs(ckpt):
-            ckpt = os.path.join(cfg.get("_config_dir", ""), ckpt)
-        sd = torch.load(ckpt, map_location="cpu", weights_only=True)
-        sd = sd.get("params", sd.get("params_ema", sd))
-        sd = {k.removeprefix("module."): v.float() for k, v in sd.items()}
+        self.params_key, sd = load_checkpoint(cfg, PARAMS_KEYS)
+        check_state_dict(sd, state_dict_shapes(net), "Restormer network_g")
         self.res_fp32_level = int((cfg.get("options") or {}).get("residual_fp32_from_level", 99))
         self.w, self.blocks = self._fold(sd, net)
         self.io = IOSpec(in_channels=3, out_channels=3, scale=1, pad_multiple=1)  # pads (reflect) itself
@@ -184,6 +222,7 @@ class Restormer(RestorationModel):
         o, w = self.ops, self.w
         n, _, h, wd = inp.shape
         ph, pw = (8 - h % 8) % 8, (8 - wd % 8) % 8
+        check_reflect_pad(h, wd, 8, "Restormer")
         x_in = F.pad(inp, (0, pw, 0, ph), mode="reflect") if (ph or pw) else inp
         s = {name: (nb, hd) for name, nb, hd in self.stages}
         x = o.intro(x_in, w["embed.w"], w["embed.bias"], out_dtype=self._rdt(0))
@@ -214,4 +253,5 @@ class Restormer(RestorationModel):
     def describe(self):
         d = super().describe()
         d["network_g"] = self.net_cfg
+        d["params_key"] = self.params_key
         return d

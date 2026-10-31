@@ -204,7 +204,7 @@ def dwconv(x, wt, bias, kh, kw, dil=1, gate=False, out=None, act=None):
                 cands.append(cf)
         # size-bucketed key: new image shapes reuse tuned configs (the 0 keeps the earlier key layout)
         key = ((n * h * w).bit_length(), w.bit_length(), c, min(gate, 1), 0, str(x.dtype)) + ((act,) if act else ())
-        launch(TUNER.pick("dw3x3p", key, cands, launch))
+        launch(TUNER.pick("dw3x3p", key, cands, launch, device=x.device))
         return out
     bc = min(64, triton.next_power_of_2(cout))
     bw = max(8, min(64, 2048 // bc))
@@ -259,8 +259,9 @@ def boxmean(x, k1, k2, oh, ow, scratch=None, out=None):
     """TLC local mean: [N,H,W,C] -> [N,OH,OW,C], window k1 x k2, valid positions only."""
     n, h, w, c = x.shape
     if scratch is None:
-        # column means (not sums) are stored, so the activation dtype has ample range
-        scratch = torch.empty((n, oh, w, c), device=x.device, dtype=x.dtype)
+        # fp32 column means: the horizontal pass differences them, and an fp16 intermediate
+        # would cancel catastrophically (e.g. columns 1000.25 / -1000 -> mean 0 instead of 0.125)
+        scratch = torch.empty((n, oh, w, c), device=x.device, dtype=torch.float32)
     if out is None:
         out = torch.empty((n, oh, ow, c), device=x.device, dtype=x.dtype)
 
@@ -278,7 +279,7 @@ def boxmean(x, k1, k2, oh, ow, scratch=None, out=None):
     cv = [dict(BLOCK_A=a, BLOCK_I=i, num_warps=nw)
           for a, i, nw in [(32, 64, 4), (16, 128, 4), (32, 128, 4), (64, 64, 4), (16, 64, 2), (8, 256, 4),
                            (16, 256, 4), (32, 32, 2)]]
-    launch_v(TUNER.pick("boxvb", key, cv, launch_v))
+    launch_v(TUNER.pick("boxvb", key, cv, launch_v, device=x.device))
     bi = triton.next_power_of_2(c)
     ch = []
     for a, i, nw in [(32, 64, 4), (64, 64, 4), (16, 128, 4), (32, 128, 4), (64, 32, 4), (128, 16, 4),
@@ -286,7 +287,7 @@ def boxmean(x, k1, k2, oh, ow, scratch=None, out=None):
         cf = dict(BLOCK_A=a, BLOCK_I=min(i, bi), num_warps=nw)
         if cf not in ch:
             ch.append(cf)
-    launch_h(TUNER.pick("boxhb", key, ch, launch_h))
+    launch_h(TUNER.pick("boxhb", key, ch, launch_h, device=x.device))
     return out
 
 

@@ -73,6 +73,10 @@ class ModelWorker:
         self.res_ring = [self.device.host_buffer((self.max_batch, 3), torch.float64)
                          for _ in range(int(wk.get("inflight", 4)) + 2)]
         self.ring_pos = 0
+        # Model weights and metric constants were produced on the current stream; order the
+        # worker stream after them. Everything else the worker stream touches is allocated and
+        # initialized on the worker stream itself (see _entry).
+        self.device.wait_stream(self.stream)
         self.load_s = time.perf_counter() - t0
 
     # ------------------------------------------------------------------ setup
@@ -104,7 +108,7 @@ class ModelWorker:
         res[:, 2].copy_((~torch.isfinite(y)).flatten(1).sum(1))
         if e["metrics"]:
             for i in range(e["b"]):
-                self.metrics.compute(e["u8_out"][i], e["u8_gt"][i], res[i])
+                self.metrics.compute(e["u8_out"][i], e["u8_gt"][i], res[i], e["mscratch"])
 
     def _entry(self, b: int, h: int, w: int, metrics: bool):
         key = (b, h, w, metrics)
@@ -114,13 +118,18 @@ class ModelWorker:
             return e
         t0 = time.perf_counter()
         m, s, d = max(1, self.io.pad_multiple), self.io.scale, self.dev
-        e = {"b": b, "h": h, "w": w, "metrics": metrics, "graph": None,
-             "inp": torch.zeros((b, 3, _ceil(h, m), _ceil(w, m)), device=d, dtype=torch.float32),
-             "u8_in": torch.zeros((b, h, w, 3), device=d, dtype=torch.uint8),
-             "u8_gt": torch.zeros((b, h * s, w * s, 3), device=d, dtype=torch.uint8),
-             "u8_out": torch.empty((b, h * s, w * s, 3), device=d, dtype=torch.uint8),
-             "res": torch.zeros((b, 3), device=d, dtype=torch.float64)}
+        # Allocate + initialize on the worker stream: the zero fills are stream-ordered before
+        # the H2D copies / pipeline, and the caching allocator only recycles these blocks for
+        # later work on the same stream. The entry owns everything its graph references (incl.
+        # the metrics scratch), so LRU eviction frees them together with the graph.
         with self.device.stream_ctx(self.stream):
+            e = {"b": b, "h": h, "w": w, "metrics": metrics, "graph": None,
+                 "inp": torch.zeros((b, 3, _ceil(h, m), _ceil(w, m)), device=d, dtype=torch.float32),
+                 "u8_in": torch.zeros((b, h, w, 3), device=d, dtype=torch.uint8),
+                 "u8_gt": torch.zeros((b, h * s, w * s, 3), device=d, dtype=torch.uint8),
+                 "u8_out": torch.empty((b, h * s, w * s, 3), device=d, dtype=torch.uint8),
+                 "res": torch.zeros((b, 3), device=d, dtype=torch.float64),
+                 "mscratch": self.metrics.scratch(h * s, w * s) if metrics else None}
             if self.warm_run:
                 self._pipeline(e)  # eager: compiles / tunes every kernel for this shape
             if self.use_graph:

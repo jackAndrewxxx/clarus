@@ -30,7 +30,7 @@ CONFIG:
   --config FILE        engine YAML (default: $CLARUS_CONFIG or configs/nafnet_gopro_width64.yaml)
   --set KEY=VALUE      override any config key, e.g. --set runtime.op_overrides.selective_scan=torch
 
-SHORTCUTS (same as --set):
+SHORTCUTS (same as --set; PATH / names are taken literally, not parsed as YAML):
   --ckpt PATH          model.checkpoint
   --device D           runtime.device (\"1\" keeps the device type, or e.g. cuda:1, npu:0, cpu)
   --dtype fp16|bf16|fp32  runtime.dtype
@@ -48,7 +48,19 @@ SHORTCUTS (same as --set):
 RUN:
   --limit N            only the first N images
   --verbose            log every batch
+  --allow-failures     exit 0 even if some images failed (default: exit 1)
 ";
+
+/// A config change from the command line, applied in order after loading the YAML.
+#[derive(Debug, PartialEq)]
+enum Override {
+    /// `--set key=value`: value parsed as YAML
+    Yaml(String),
+    /// shortcut flag: `key` = literal value (no YAML parsing, so paths keep `#`, `:` etc.)
+    Value(&'static str, Value),
+    /// `--device`: resolved against the configured device type
+    Device(String),
+}
 
 struct Args {
     cmd: String,
@@ -57,45 +69,49 @@ struct Args {
     out: Option<PathBuf>,
     report: Option<PathBuf>,
     config: String,
-    sets: Vec<String>,
+    sets: Vec<Override>,
     limit: Option<usize>,
     verbose: bool,
+    allow_failures: bool,
 }
 
-fn parse_args() -> Result<Args, String> {
-    let mut it = std::env::args().skip(1);
+fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut it = argv.into_iter();
     let cmd = it.next().ok_or(USAGE)?;
     if cmd == "-h" || cmd == "--help" {
         return Err(USAGE.into());
     }
     let default_config = std::env::var("CLARUS_CONFIG").unwrap_or_else(|_| env!("CLARUS_BUILD_CONFIG").to_string());
     let mut a = Args { cmd, lq: None, gt: None, out: None, report: None, config: default_config, sets: vec![],
-                       limit: None, verbose: false };
+                       limit: None, verbose: false, allow_failures: false };
     while let Some(flag) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{flag} needs a value"));
         let list = |s: String| format!("[{s}]");
+        let names = |s: String| json!(s.split(',').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>());
+        use Override::{Value as Lit, Yaml};
         match flag.as_str() {
             "--lq" | "--input" => a.lq = Some(val()?.into()),
             "--gt" => a.gt = Some(val()?.into()),
             "--save" | "--output" => a.out = Some(val()?.into()),
             "--report" => a.report = Some(val()?.into()),
             "--config" => a.config = val()?,
-            "--set" => a.sets.push(val()?),
-            "--ckpt" => a.sets.push(format!("model.checkpoint={}", val()?)),
-            "--device" => a.sets.push(format!("@device={}", val()?)),
-            "--dtype" => a.sets.push(format!("runtime.dtype={}", val()?)),
-            "--backends" => a.sets.push(format!("runtime.backends={}", list(val()?))),
-            "--no-graph" => a.sets.push("runtime.graphs=false".into()),
-            "--safe" => a.sets.push("model.options.residual_fp32_from_level=0".into()),
-            "--batch-sizes" => a.sets.push(format!("scheduler.batch_sizes={}", list(val()?))),
-            "--max-batch" => a.sets.push(format!("scheduler.batch_sizes=[1,{}]", val()?)),
-            "--batching" => a.sets.push(format!("scheduler.batching={}", val()?)),
-            "--shapes" => a.sets.push(format!("@shapes={}", val()?)),
-            "--inflight" => a.sets.push(format!("scheduler.inflight={}", val()?)),
-            "--io-threads" => a.sets.push(format!("io.threads={}", val()?)),
-            "--png-level" => a.sets.push(format!("io.png_level={}", val()?)),
+            "--set" => a.sets.push(Yaml(val()?)),
+            "--ckpt" => a.sets.push(Lit("model.checkpoint", json!(val()?))),
+            "--device" => a.sets.push(Override::Device(val()?)),
+            "--dtype" => a.sets.push(Lit("runtime.dtype", json!(val()?))),
+            "--backends" => a.sets.push(Lit("runtime.backends", names(val()?))),
+            "--no-graph" => a.sets.push(Yaml("runtime.graphs=false".into())),
+            "--safe" => a.sets.push(Yaml("model.options.residual_fp32_from_level=0".into())),
+            "--batch-sizes" => a.sets.push(Yaml(format!("scheduler.batch_sizes={}", list(val()?)))),
+            "--max-batch" => a.sets.push(Yaml(format!("scheduler.batch_sizes=[1,{}]", val()?))),
+            "--batching" => a.sets.push(Lit("scheduler.batching", json!(val()?))),
+            "--shapes" => a.sets.push(Lit("scheduler.shapes", config::parse_shapes(&val()?)?)),
+            "--inflight" => a.sets.push(Yaml(format!("scheduler.inflight={}", val()?))),
+            "--io-threads" => a.sets.push(Yaml(format!("io.threads={}", val()?))),
+            "--png-level" => a.sets.push(Yaml(format!("io.png_level={}", val()?))),
             "--limit" => a.limit = Some(val()?.parse().map_err(|_| "bad --limit")?),
             "--verbose" => a.verbose = true,
+            "--allow-failures" => a.allow_failures = true,
             "-h" | "--help" => return Err(USAGE.into()),
             f => return Err(format!("unknown option {f}\n\n{USAGE}")),
         }
@@ -148,36 +164,47 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn main() {
-    if let Err(e) = real_main() {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
-}
-fn load_settings(args: &Args) -> Result<config::Settings, String> {
-    let mut s = config::load(&args.config)?;
-    for a in &args.sets {
-        if let Some(d) = a.strip_prefix("@device=") {
-            let spec = config::device_spec(&s.raw["runtime"]["device"], d);
-            s.raw["runtime"]["device"] = json!(spec);
-        } else if let Some(v) = a.strip_prefix("@shapes=") {
-            s.raw["scheduler"]["shapes"] = config::parse_shapes(v)?;
-        } else {
-            s.set(a)?;
+    match real_main() {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
     }
+}
+
+fn apply_overrides(s: &mut config::Settings, sets: &[Override]) -> Result<(), String> {
+    for o in sets {
+        match o {
+            Override::Yaml(a) => s.set(a)?,
+            Override::Value(key, v) => s.set_value(key, v.clone()),
+            Override::Device(d) => {
+                let spec = config::device_spec(&s.raw["runtime"]["device"], d);
+                s.set_value("runtime.device", json!(spec));
+            }
+        }
+    }
+    config::check_sections(&s.raw)
+}
+
+fn load_settings(args: &Args) -> Result<config::Settings, String> {
+    let mut s = config::load(&args.config)?;
+    apply_overrides(&mut s, &args.sets)?;
     Ok(s)
 }
 
-fn real_main() -> Result<(), String> {
+/// Process exit code on success: 0, or 1 if any image failed (unless --allow-failures).
+fn real_main() -> Result<i32, String> {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() <= 1 || argv.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
-        return Ok(());
+        return Ok(0);
     }
     if argv.len() == 3 && argv[1] == "png-hash" {
-        return png_hash(Path::new(&argv[2]));
+        return png_hash(Path::new(&argv[2])).map(|_| 0);
     }
-    let args = parse_args()?;
+    let args = parse_args(argv.into_iter().skip(1))?;
     let settings = load_settings(&args)?;
     let t_start = Instant::now();
     let metrics = args.cmd == "eval";
@@ -185,6 +212,9 @@ fn real_main() -> Result<(), String> {
     let inflight = settings.usize_or("scheduler", "inflight", 3)?.max(1);
     let fixed_shapes = settings.shapes()?;
     let unknown = settings.unknown_shape()?;
+    let batching = settings.batching()?;
+    let io_threads = settings.usize_or("io", "threads", 16)?.max(1);
+    let png_level = settings.usize_or("io", "png_level", 1)? as i32;
 
     let lq_dir = args.lq.clone().unwrap();
     let mut names = list_pngs(&lq_dir)?;
@@ -265,18 +295,30 @@ fn real_main() -> Result<(), String> {
         planes: [plane("lq"), plane("gt"), plane("out")],
         scale: info["scale"].as_u64().unwrap_or(1) as usize,
     };
+    // IO threads write into these slots through raw pointers (see io::SlotMem for the
+    // initialized / exclusive-ownership contract); validate the layout before the first job
+    mem.check(slots, info["slots"].as_u64().unwrap_or(0) as usize)?;
     let cfg = Config {
         batch_sizes: batch_sizes.clone(),
         max_inflight: inflight,
-        io_threads: settings.usize_or("io", "threads", 16)?.max(1),
+        io_threads,
         slots,
         metrics,
-        png_level: settings.usize_or("io", "png_level", 1)? as i32,
+        png_level,
         verbose: args.verbose,
-        batching: settings.batching()?,
+        batching,
     };
-    let (results, stats) = engine::run(&worker, mem, &reqs, &cfg)?;
-    let fin = worker.call("shutdown", "")?;
+    // Cleanup order on success and error alike: `run` stops dispatching and joins every IO
+    // job, then the worker drains its device queue and synchronizes, and only after that is
+    // the worker (owner of the host slot memory) dropped, at the end of this function.
+    let run = engine::run(&worker, mem, &reqs, &cfg);
+    let fin = worker.call("shutdown", "");
+    let (results, stats) = match (run, fin.as_ref()) {
+        (Ok(r), _) => r,
+        (Err(e), Err(fe)) => return Err(format!("{e}\n(worker shutdown also failed: {fe})")),
+        (Err(e), Ok(_)) => return Err(e),
+    };
+    let fin = fin?;
     let total = t_start.elapsed().as_secs_f64();
     let ok: Vec<_> = results.iter().filter(|r| r.error.is_none()).collect();
     let mean = |f: &dyn Fn(&engine::ImageResult) -> Option<f64>| -> Option<f64> {
@@ -319,7 +361,14 @@ fn real_main() -> Result<(), String> {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         println!("report            {}", path.display());
     }
-    Ok(())
+    if stats.failed > 0 {
+        eprintln!("[clarus] {} of {} images failed{}", stats.failed, stats.images,
+                  if args.allow_failures { " (--allow-failures: exit 0)" } else { "" });
+        if !args.allow_failures {
+            return Ok(1);
+        }
+    }
+    Ok(0)
 }
 
 /// Ops not served by the first configured backend, e.g. "pixel_shuffle->torch".
@@ -337,4 +386,47 @@ fn info_ops_fallbacks(shutdown_json: &str) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Args {
+        parse_args(v.iter().map(|s| s.to_string())).unwrap()
+    }
+
+    #[test]
+    fn string_shortcuts_are_literal() {
+        let dir = std::env::temp_dir().join(format!("clarus_main_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("c.yaml");
+        std::fs::write(&cfg, "runtime:\n  device: npu:0\n").unwrap();
+        let a = args(&["infer", "--input", "i", "--output", "o", "--config", cfg.to_str().unwrap(),
+                       "--ckpt", "weights #final.pth", "--dtype", "bf16", "--backends", "triton, torch",
+                       "--batching", "dynamic", "--shapes", "720x1280", "--device", "1", "--inflight", "4",
+                       "--set", "model.options.x=7 # comment", "--set", "model.name=false"]);
+        let mut s = config::load(cfg.to_str().unwrap()).unwrap();
+        apply_overrides(&mut s, &a.sets).unwrap();
+        assert_eq!(s.raw["model"]["checkpoint"], json!("weights #final.pth"));
+        assert_eq!(s.raw["runtime"]["dtype"], json!("bf16"));
+        assert_eq!(s.raw["runtime"]["backends"], json!(["triton", "torch"]));
+        assert_eq!(s.raw["runtime"]["device"], json!("npu:1"));
+        assert_eq!(s.raw["scheduler"]["batching"], json!("dynamic"));
+        assert_eq!(s.raw["scheduler"]["shapes"], json!([[720, 1280]]));
+        assert_eq!(s.raw["scheduler"]["inflight"], json!(4));
+        // --set stays YAML-typed
+        assert_eq!(s.raw["model"]["options"]["x"], json!(7));
+        assert_eq!(s.raw["model"]["name"], json!(false));
+        // a section replaced by a scalar is an error, not a panic
+        let a = args(&["infer", "--input", "i", "--output", "o", "--set", "runtime=1"]);
+        assert!(apply_overrides(&mut s, &a.sets).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allow_failures_flag() {
+        assert!(!args(&["infer", "--input", "i", "--output", "o"]).allow_failures);
+        assert!(args(&["infer", "--input", "i", "--output", "o", "--allow-failures"]).allow_failures);
+    }
 }

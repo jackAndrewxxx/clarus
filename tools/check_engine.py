@@ -4,7 +4,10 @@ Builds a small mixed dataset (several shapes incl. non-multiple-of-16, a graysca
 RGBA PNG), runs `clarus eval --save`, then recomputes every image with the
 reference fp32 network and basicsr's calculate_psnr / calculate_ssim.
 
-  python tools/check_engine.py [--device 0]
+  python tools/check_engine.py [--config CFG] [--device 0]
+
+The engine and the reference are given the same resolved config file (the engine's own default
+would follow $CLARUS_CONFIG).
 """
 from __future__ import annotations
 
@@ -53,20 +56,29 @@ def make_dataset(dst):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=DEFAULT_CONFIG)
     ap.add_argument("--device", default="0")
     args = ap.parse_args()
+    config = os.path.abspath(args.config)
+    print(f"config {config}", flush=True)
     dst = "/tmp/clarus_check"
     names = make_dataset(dst)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=args.device)
-    cmd = [BIN, "eval", "--lq", f"{dst}/lq", "--gt", f"{dst}/gt", "--save", f"{dst}/out",
+    env.pop("CLARUS_CONFIG", None)
+    cmd = [BIN, "eval", "--config", config, "--lq", f"{dst}/lq", "--gt", f"{dst}/gt", "--save", f"{dst}/out",
            "--report", f"{dst}/report.json", "--max-batch", "2"]
     subprocess.run(cmd, check=True, env=env)
-    rep = {r["name"]: r for r in json.load(open(f"{dst}/report.json"))["images"]}
+    rows = json.load(open(f"{dst}/report.json"))["images"]
+    rep = {r["name"]: r for r in rows}
+    if len(rows) != len(rep) or set(rep) != set(names):
+        print(f"FAIL: engine report has {len(rows)} rows / names {sorted(rep)}, expected {names}")
+        sys.exit(1)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
-    ref = build_reference(DEFAULT_CONFIG)
+    ref = build_reference(config)
+    print(ref.describe(), flush=True)
     worst = {"psnr": 0.0, "ssim": 0.0, "pix": 0.0}
     for name in names:
         lq = cv2.imread(f"{dst}/lq/{name}", cv2.IMREAD_COLOR)

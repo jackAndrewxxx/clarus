@@ -2,13 +2,14 @@
 
 model config keys:
   checkpoint:  official .pth (plain state dict, e.g. fftformer_GoPro.pth)
+  params_key:  state-dict key in the checkpoint (default: plain dict, else params, then params_ema)
   network_g:   {type: fftformer, dim, num_blocks, num_refinement_blocks, ffn_expansion_factor, bias}
 
 Inference layout: NHWC; LayerNorm affine folded into the following 1x1 conv; the per-8x8-patch
 FFT filter (DFFN) and the FFT correlation (FSAS) are evaluated as small dense DFT products
 (`patch_filter`, `patch_corr`); FSAS's LayerNorm + `v *` run in the project_out GEMM prologue
 (`ln_mul_linear`); Fuse's conv2 + split-add is folded into one GEMM. The input is reflect-padded
-to a multiple of 32 like the official test script.
+to a multiple of 32 like the official test script (needs H, W >= 17).
 """
 from __future__ import annotations
 
@@ -16,11 +17,58 @@ import torch
 import torch.nn.functional as F
 
 from .. import IOSpec, RestorationModel, register_model
-from .._fold import Folder, kn, ln_fold, load_state_dict, pad_gated_hidden, resolve_network_g, \
-    scatter_rows
+from .._fold import Folder, check_reflect_pad, check_state_dict, kn, ln_fold, load_checkpoint, \
+    pad_gated_hidden, resolve_network_g, scatter_rows
 
 DEFAULTS = dict(inp_channels=3, out_channels=3, dim=48, num_blocks=[6, 6, 12, 8], num_refinement_blocks=4,
                 ffn_expansion_factor=3, bias=False)
+PARAMS_KEYS = ("params", "params_ema")
+
+
+def _conv(s, name, co, ci, k, bias):
+    s[f"{name}.weight"] = (co, ci, k, k)
+    if bias:
+        s[f"{name}.bias"] = (co,)
+
+
+def _block_shapes(s, p, c, ffn, bias, att):
+    """TransformerBlock(c, ffn, bias, att) (WithBias LayerNorms, 8x8 patches)."""
+    hid = int(c * ffn)
+    if att:
+        s[f"{p}.norm1.body.weight"] = s[f"{p}.norm1.body.bias"] = (c,)
+        _conv(s, f"{p}.attn.to_hidden", 6 * c, c, 1, bias)
+        _conv(s, f"{p}.attn.to_hidden_dw", 6 * c, 1, 3, bias)
+        _conv(s, f"{p}.attn.project_out", c, 2 * c, 1, bias)
+        s[f"{p}.attn.norm.body.weight"] = s[f"{p}.attn.norm.body.bias"] = (2 * c,)
+    s[f"{p}.norm2.body.weight"] = s[f"{p}.norm2.body.bias"] = (c,)
+    _conv(s, f"{p}.ffn.project_in", 2 * hid, c, 1, bias)
+    _conv(s, f"{p}.ffn.dwconv", 2 * hid, 1, 3, bias)
+    s[f"{p}.ffn.fft"] = (2 * hid, 1, 1, 8, 5)
+    _conv(s, f"{p}.ffn.project_out", c, hid, 1, bias)
+
+
+def state_dict_shapes(net):
+    """Exact {key: shape} of the upstream fftformer state dict."""
+    d, nb, ffn, b = net["dim"], net["num_blocks"], net["ffn_expansion_factor"], net["bias"]
+    s = {}
+    _conv(s, "patch_embed.proj", d, 3, 3, False)
+    for name, n, c, att in (("encoder_level1", nb[0], d, False), ("encoder_level2", nb[1], 2 * d, False),
+                            ("encoder_level3", nb[2], 4 * d, False), ("decoder_level3", nb[2], 4 * d, True),
+                            ("decoder_level2", nb[1], 2 * d, True), ("decoder_level1", nb[0], d, True),
+                            ("refinement", net["num_refinement_blocks"], d, True)):
+        for i in range(n):
+            _block_shapes(s, f"{name}.{i}", c, ffn, b, att)
+    for name, c in (("down1_2", d), ("down2_3", 2 * d)):
+        _conv(s, f"{name}.body.1", 2 * c, c, 3, False)
+    for name, c in (("up3_2", 4 * d), ("up2_1", 2 * d)):
+        _conv(s, f"{name}.body.1", c // 2, c, 3, False)
+    _conv(s, "reduce_chan_level2", 2 * d, 4 * d, 1, b)                      # unused upstream
+    for name, n in (("fuse2", 2 * d), ("fuse1", d)):                         # Fuse(n_feat)
+        _block_shapes(s, f"{name}.att_channel", 2 * n, 2.66, False, False)   # TransformerBlock defaults
+        _conv(s, f"{name}.conv", 2 * n, 2 * n, 1, True)
+        _conv(s, f"{name}.conv2", 2 * n, 2 * n, 1, True)
+    _conv(s, "output", 3, d, 3, b)
+    return s
 
 
 @register_model("fftformer")
@@ -34,7 +82,9 @@ class FFTformer(RestorationModel):
         if net["inp_channels"] != 3 or net["out_channels"] != 3:
             raise ValueError("FFTformer: only 3-channel in / out is supported")
         self.net_cfg = net
-        f = Folder(load_state_dict(cfg), device, dtype,
+        self.params_key, sd = load_checkpoint(cfg, PARAMS_KEYS)
+        check_state_dict(sd, state_dict_shapes(net), "fftformer network_g")
+        f = Folder(sd, device, dtype,
                    ignore=("reduce_chan_level2.weight", "reduce_chan_level2.bias"))  # unused upstream
         self.blocks = {}
         self._fold(f, net)
@@ -129,6 +179,7 @@ class FFTformer(RestorationModel):
         o, w = self.ops, self.w
         n, _, h, wd = inp.shape
         ph, pw = (32 - h % 32) % 32, (32 - wd % 32) % 32
+        check_reflect_pad(h, wd, 32, "FFTformer")
         x_in = F.pad(inp, (0, pw, 0, ph), mode="reflect") if (ph or pw) else inp
         e1 = self._stage(o.intro(x_in, w["embed.w"], w["embed.bias"]), "encoder_level1")
         e2 = self._stage(o.conv3x3(o.resize_bilinear(e1, 0.5), w["down1_2.w"]), "encoder_level2")
@@ -144,4 +195,5 @@ class FFTformer(RestorationModel):
     def describe(self):
         d = super().describe()
         d["network_g"] = self.net_cfg
+        d["params_key"] = self.params_key
         return d

@@ -22,7 +22,13 @@ def wrap(mod, name, label):
     fn = getattr(mod, name)
 
     def inner(*a, **k):
+        # benchmark launches rewrite `out`, which may alias an input (out=residual): restore it
+        # before the real call
+        out = k.get("out")
+        saved = out.clone() if isinstance(out, torch.Tensor) else None
         t = do_bench(lambda: fn(*a, **k), warmup=3, rep=20)
+        if saved is not None:
+            out.copy_(saved)
         meta = {f: k.get(f) for f in ("m", "n", "k", "pro", "a_mode", "c_mode", "gate", "act", "epi")}
         meta["shape"] = tuple(a[0].shape)
         meta["dtype"] = a[0].dtype
